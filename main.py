@@ -46,7 +46,7 @@ async def handler(event):
     await send_to_n8n(event.message)
 
 
-async def backfill(limit=3):
+async def backfill(limit=30):
     """Временно: прогнать последние посты каналов, чтобы не ждать новый.
     Убери вызов в main() после проверки."""
     for channel in CHANNELS:
