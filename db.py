@@ -27,48 +27,70 @@ def _connect() -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS vacancies (
-            id         TEXT PRIMARY KEY,
-            channel    TEXT,
-            title      TEXT,
-            url        TEXT,
-            score      INTEGER,
-            decision   TEXT,
-            created_at TEXT,
-            message    TEXT
+            id          TEXT PRIMARY KEY,
+            channel     TEXT,
+            title       TEXT,
+            url         TEXT,
+            score       INTEGER,
+            decision    TEXT,
+            created_at  TEXT,
+            message     TEXT,
+            ai_score    INTEGER,
+            ai_decision TEXT,
+            ai_summary  TEXT,
+            ai_reason   TEXT,
+            ai_message  TEXT,
+            ai_relevant INTEGER
         )
         """
     )
-    # Миграция старых БД: добавляем колонку message, если её ещё нет.
-    try:
-        conn.execute("ALTER TABLE vacancies ADD COLUMN message TEXT")
-    except sqlite3.OperationalError:
-        pass
+    # Миграция старых БД: добавляем недостающие колонки (ALTER идемпотентен).
+    for col, typ in (
+        ("message", "TEXT"),
+        ("ai_score", "INTEGER"), ("ai_decision", "TEXT"),
+        ("ai_summary", "TEXT"), ("ai_reason", "TEXT"),
+        ("ai_message", "TEXT"), ("ai_relevant", "INTEGER"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE vacancies ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     return conn
 
 
-def save_vacancy(vacancy_id, channel, title, url, score=None, decision=None, message=None):
-    """Сохранить вакансию. Повторный id игнорируется (INSERT OR IGNORE).
+def save_vacancy(vacancy_id, channel, title, url, ai=None):
+    """Сохранить вакансию вместе с результатом AI-анализа (один раз).
 
-    message — готовый текст из ответа n8n (если вернул), для показа в пагинации.
+    ai — dict из parse_ai_result (score/decision/summary/reason/message/relevant)
+    или None. Повторный id игнорируется (INSERT OR IGNORE) — AI повторно не
+    вызывается и данные не перезаписываются.
     """
+    ai = ai or {}
+    relevant = ai.get("relevant")
+    ai_relevant = None if relevant is None else (1 if relevant else 0)
+
     with _lock:
         conn = _connect()
         try:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO vacancies
-                    (id, channel, title, url, score, decision, created_at, message)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, channel, title, url, created_at,
+                     ai_score, ai_decision, ai_summary, ai_reason, ai_message, ai_relevant)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     vacancy_id,
                     channel,
                     title,
                     url,
-                    score,
-                    decision,
                     datetime.now(timezone.utc).isoformat(),
-                    message,
+                    ai.get("score"),
+                    ai.get("decision"),
+                    ai.get("summary"),
+                    ai.get("reason"),
+                    ai.get("message"),
+                    ai_relevant,
                 ),
             )
             conn.commit()
@@ -83,20 +105,18 @@ def recent(limit: int, prefix: str = None):
     """
     conn = _connect()
     try:
+        # COALESCE: показываем ai_message/ai_score, для старых записей — старые
+        # колонки. Форма строки не меняется → пагинация/format_vacancy не трогаем.
+        cols = ("SELECT title, channel, url, "
+                "COALESCE(ai_score, score), COALESCE(ai_message, message), created_at "
+                "FROM vacancies")
         if prefix:
             return conn.execute(
-                """
-                SELECT title, channel, url, score, message, created_at
-                FROM vacancies WHERE id LIKE ?
-                ORDER BY created_at DESC LIMIT ?
-                """,
+                cols + " WHERE id LIKE ? ORDER BY created_at DESC LIMIT ?",
                 (prefix + "%", limit),
             ).fetchall()
         return conn.execute(
-            """
-            SELECT title, channel, url, score, message, created_at
-            FROM vacancies ORDER BY created_at DESC LIMIT ?
-            """,
+            cols + " ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
     finally:
@@ -127,21 +147,31 @@ def stats() -> dict:
 
 
 def parse_ai_result(response):
-    """Достать (score, decision, message) из ответа вебхука n8n, если он вернул.
+    """Разобрать ответ вебхука n8n с результатом AI-анализа.
 
-    Терпимо к формату: объект {...}, либо массив [{...}] (как у n8n).
-    message — готовый текст для Telegram (ключи message/text/output/...).
-    Если ответ не JSON или полей нет — вернёт (None, None, None).
+    Ожидаемый JSON (терпимо к obj {...} и массиву [{...}]):
+        {"relevant": true, "score": 87, "decision": "hot",
+         "summary": "...", "reason": "...", "message": "🔥 ..."}
+
+    Возвращает dict {score, decision, summary, reason, message, relevant}
+    или None, если ответ не JSON. message также читается из text/output/...
     """
     try:
         data = response.json()
     except Exception:
-        return None, None, None
+        return None
 
     if isinstance(data, list):
         data = data[0] if data else {}
     if not isinstance(data, dict):
-        return None, None, None
+        return None
+
+    def _str(*keys):
+        for k in keys:
+            v = data.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        return None
 
     score = data.get("score")
     try:
@@ -149,13 +179,13 @@ def parse_ai_result(response):
     except (TypeError, ValueError):
         score = None
 
-    decision = data.get("decision")
+    relevant = data.get("relevant")
 
-    message = None
-    for key in ("message", "text", "output", "formatted", "telegram", "result"):
-        val = data.get(key)
-        if isinstance(val, str) and val.strip():
-            message = val
-            break
-
-    return score, decision, message
+    return {
+        "score": score,
+        "decision": data.get("decision"),
+        "summary": _str("summary"),
+        "reason": _str("reason"),
+        "message": _str("message", "text", "output", "formatted", "telegram", "result"),
+        "relevant": bool(relevant) if relevant is not None else None,
+    }

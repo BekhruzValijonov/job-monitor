@@ -308,16 +308,9 @@ def _cleanup_pid():
 
 # --- Тексты ----------------------------------------------------------------
 
-def status_text(lang: str) -> str:
-    running = t(lang, "st_on") if reader_running() else t(lang, "st_off")
-    s = db.stats()
-    lines = [f"*{t(lang, 'st_monitoring')}:* {running}", f"*{t(lang, 'st_total')}:* {s['total']}"]
-    if s["last"]:
-        lines.append(f"*{t(lang, 'st_last')}:* {s['last']}")
-    if s["by_channel"]:
-        lines.append(f"\n*{t(lang, 'st_by_channel')}:*")
-        lines += [f"  {ch or '—'}: {cnt}" for ch, cnt in s["by_channel"]]
-    return "\n".join(lines)
+def short_status(lang: str) -> str:
+    state = t(lang, "st_on") if reader_running() else t(lang, "st_off")
+    return f"{t(lang, 'st_monitoring')}: {state}"
 
 
 def format_vacancy(lang: str, row) -> str:
@@ -440,7 +433,7 @@ async def handler(event):
         await event.respond(t(lang, "m_title"), buttons=kb_main(lang))
     elif token == "control":
         st["menu"] = "control"
-        await event.respond(status_text(lang), buttons=kb_control(lang))
+        await event.respond(t(lang, "b_control"), buttons=kb_control(lang))
     elif token == "sources":
         st["menu"] = "sources"
         await event.respond(t(lang, "sources_title"), buttons=kb_sources(lang))
@@ -460,7 +453,7 @@ async def handler(event):
         await event.respond(start_reader(lang), buttons=kb_control(lang))
     elif token == "c_status":
         st["menu"] = "control"
-        await event.respond(status_text(lang), buttons=kb_control(lang))
+        await event.respond(short_status(lang), buttons=kb_control(lang))
     elif token in ("src_channels", "src_remoteok", "src_wwr", "src_hh"):
         source = token[4:]
         st["source"] = source
@@ -478,7 +471,11 @@ async def handler(event):
                 await event.respond(t(lang, "vac_empty"), buttons=kb_pagination(lang))
             else:
                 for row in rows:
-                    await event.respond(format_vacancy(lang, row), link_preview=False)
+                    await event.respond(
+                        format_vacancy(lang, row),
+                        link_preview=False,
+                        parse_mode=None,  # текст n8n/URL не парсим как markdown
+                    )
     elif token == "back":
         if st.get("menu") == "pagination":
             st["menu"] = "sources"

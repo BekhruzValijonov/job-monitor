@@ -1,3 +1,4 @@
+import fcntl
 import os
 import requests
 from telethon import TelegramClient, events
@@ -54,11 +55,11 @@ async def send_to_n8n(message):
         "posted_at": message.date.isoformat(),
     }
 
-    score, decision, ai_message = None, None, None
+    ai = None
     try:
-        response = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=15)
+        response = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=60)
         print("Sent to n8n:", response.status_code, payload["channel"], text[:120])
-        score, decision, ai_message = db.parse_ai_result(response)
+        ai = db.parse_ai_result(response)
     except Exception as e:
         print("Error sending to n8n:", e)
 
@@ -67,9 +68,7 @@ async def send_to_n8n(message):
         channel=payload["channel"],
         title=title,
         url=payload["url"],
-        score=score,
-        decision=decision,
-        message=ai_message,
+        ai=ai,
     )
 
 
@@ -95,5 +94,21 @@ async def main():
     await client.run_until_disconnected()
 
 
-with client:
-    client.loop.run_until_complete(main())
+def _ensure_single_instance():
+    """Не дать запустить второй экземпляр слушателя (его уже авто-стартует бот):
+    иначе два процесса дерутся за сессию Telethon → 'database is locked'."""
+    lock = open("channels.lock", "w")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(
+            "channels.py уже запущен (его поднимает бот).\n"
+            "Останови старый процесс: pkill -f channels.py"
+        )
+    return lock  # держим открытым, чтобы flock не снялся
+
+
+if __name__ == "__main__":
+    _instance_lock = _ensure_single_instance()
+    with client:
+        client.loop.run_until_complete(main())

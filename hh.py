@@ -75,11 +75,11 @@ def send_to_n8n(vacancy: dict):
         print("Skip garbage:", reason, "::", payload["title"])
         return
 
-    score, decision, ai_message = None, None, None
+    ai = None
     try:
-        res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=20)
+        res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=60)
         print("Sent to n8n:", res.status_code, payload["title"])
-        score, decision, ai_message = db.parse_ai_result(res)
+        ai = db.parse_ai_result(res)
     except Exception as e:
         print("Error sending to n8n:", e)
 
@@ -88,9 +88,7 @@ def send_to_n8n(vacancy: dict):
         channel=payload["channel"],
         title=payload["title"],
         url=payload["url"],
-        score=score,
-        decision=decision,
-        message=ai_message,
+        ai=ai,
     )
 
 
