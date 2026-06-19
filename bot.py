@@ -14,6 +14,7 @@
 вебхука — дословно, иначе формат собирается из сохранённых полей.
 """
 
+import fcntl
 import json
 import os
 import re
@@ -488,9 +489,27 @@ async def handler(event):
     # остальное игнорируем (без спама справкой)
 
 
+_instance_lock = None  # держим открытый файл, чтобы flock не снялся
+
+
+def _ensure_single_instance():
+    """Не дать запустить второй экземпляр бота: иначе два процесса дерутся
+    за файл сессии Telethon → 'database is locked'."""
+    global _instance_lock
+    _instance_lock = open("bot.lock", "w")
+    try:
+        fcntl.flock(_instance_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(
+            "Бот уже запущен (bot.lock занят другим процессом).\n"
+            "Останови старый процесс: pkill -f bot.py"
+        )
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан в .env (получи у @BotFather).")
+    _ensure_single_instance()
     bot.start(bot_token=BOT_TOKEN)
     print("Control bot started.")
     # Авто-старт слушателя каналов: новые вакансии форвардятся в n8n как раньше.
