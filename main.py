@@ -3,7 +3,13 @@ import requests
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 
+import db
+from filters import garbage_reason
+from seen_store import SeenStore
+
 load_dotenv()
+
+seen_store = SeenStore("processed_telegram.json")
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
@@ -23,13 +29,27 @@ async def send_to_n8n(message):
     if not text.strip():
         return
 
+    key = f"{message.chat_id}_{message.id}"
+    if seen_store.seen(key):
+        return
+    seen_store.add(key)
+
+    reason = garbage_reason(text)
+    if reason:
+        print("Skip garbage:", reason, "::", text[:80].replace("\n", " "))
+        return
+
     chat = await message.get_chat()
     username = getattr(chat, "username", None)
+
+    title = text.strip().splitlines()[0][:120]
 
     payload = {
         "source": "telegram",
         "channel": f"@{username}" if username else str(message.chat_id),
+        "title": title,
         "text": text,
+        "text_preview": text[:500],
         "url": f"https://t.me/{username}/{message.id}" if username else "",
         "posted_at": message.date.isoformat(),
     }
@@ -37,8 +57,19 @@ async def send_to_n8n(message):
     try:
         response = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=15)
         print("Sent to n8n:", response.status_code, payload["channel"], text[:120])
+        score, decision = db.parse_ai_result(response)
     except Exception as e:
         print("Error sending to n8n:", e)
+        score, decision = None, None
+
+    db.save_vacancy(
+        vacancy_id=f"telegram_{message.chat_id}_{message.id}",
+        channel=payload["channel"],
+        title=title,
+        url=payload["url"],
+        score=score,
+        decision=decision,
+    )
 
 
 @client.on(events.NewMessage(chats=CHANNELS))

@@ -3,6 +3,17 @@
 .venv/
 venv/
 
+# Локальное состояние дедупа (обработанные вакансии)
+processed_*.json
+
+# Локальная БД вакансий
+vacancies.db
+
+# Состояние/логи управляющего бота
+reader.pid
+logs/
+settings.json
+
 # Сессия Telethon (содержит авторизацию — не коммитить!)
 *.session
 *.session-journal

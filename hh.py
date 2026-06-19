@@ -3,6 +3,10 @@ import time
 import requests
 from dotenv import load_dotenv
 
+import db
+from filters import garbage_reason
+from seen_store import SeenStore
+
 load_dotenv()
 
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
@@ -64,27 +68,44 @@ def send_to_n8n(vacancy: dict):
 """,
         "url": vacancy.get("alternate_url", ""),
     }
+    payload["text_preview"] = payload["text"].strip()[:500]
 
+    reason = garbage_reason(payload["text"])
+    if reason:
+        print("Skip garbage:", reason, "::", payload["title"])
+        return
+
+    score, decision = None, None
     try:
         res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=20)
         print("Sent to n8n:", res.status_code, payload["title"])
+        score, decision = db.parse_ai_result(res)
     except Exception as e:
         print("Error sending to n8n:", e)
 
+    db.save_vacancy(
+        vacancy_id=f"hh_{vacancy.get('id')}",
+        channel=payload["channel"],
+        title=payload["title"],
+        url=payload["url"],
+        score=score,
+        decision=decision,
+    )
+
 
 def main():
-    seen = set()
+    store = SeenStore("processed_hh.json")
 
     for query in SEARCH_QUERIES:
         vacancies = search_hh(query)
 
         for vacancy in vacancies:
-            vacancy_id = vacancy.get("id")
+            key = f"hh_{vacancy.get('id')}"
 
-            if vacancy_id in seen:
+            if store.seen(key):
                 continue
 
-            seen.add(vacancy_id)
+            store.add(key)
             send_to_n8n(vacancy)
             time.sleep(0.5)
 
