@@ -13,8 +13,7 @@ vacancies.db-shm
 
 # Состояние/логи управляющего бота
 reader.pid
-bot.lock
-channels.lock
+*.lock
 logs/
 settings.json
 

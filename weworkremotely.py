@@ -9,6 +9,7 @@ import requests
 from dotenv import load_dotenv
 
 import db
+import singleton
 from filters import garbage_reason
 from seen_store import SeenStore
 
@@ -168,6 +169,7 @@ def main():
         return
 
     # По умолчанию — слушаем RSS в цикле, дубли отсекает seen_store.
+    singleton.acquire("weworkremotely.lock", "weworkremotely.py")
     print(f"WeWorkRemotely listener started (каждые {POLL_INTERVAL}s).")
     while True:
         try:

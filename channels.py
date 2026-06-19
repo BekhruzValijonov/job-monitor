@@ -1,10 +1,10 @@
-import fcntl
 import os
 import requests
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 
 import db
+import singleton
 from filters import garbage_reason
 from seen_store import SeenStore
 
@@ -94,21 +94,8 @@ async def main():
     await client.run_until_disconnected()
 
 
-def _ensure_single_instance():
-    """Не дать запустить второй экземпляр слушателя (его уже авто-стартует бот):
-    иначе два процесса дерутся за сессию Telethon → 'database is locked'."""
-    lock = open("channels.lock", "w")
-    try:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        raise SystemExit(
-            "channels.py уже запущен (его поднимает бот).\n"
-            "Останови старый процесс: pkill -f channels.py"
-        )
-    return lock  # держим открытым, чтобы flock не снялся
-
-
 if __name__ == "__main__":
-    _instance_lock = _ensure_single_instance()
+    # Один экземпляр (его поднимает бот): иначе два процесса дерутся за сессию.
+    singleton.acquire("channels.lock", "channels.py")
     with client:
         client.loop.run_until_complete(main())

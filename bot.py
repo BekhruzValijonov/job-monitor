@@ -34,11 +34,18 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID")) if os.getenv("OWNER_ID") else None
 
-PID_FILE = "reader.pid"
-LOG_FILE = "logs/reader.log"
 LANG_FILE = "settings.json"
 DEFAULT_LANG = "ru"
-READER_CMD = [sys.executable, "channels.py"]
+LOG_DIR = "logs"
+
+# Источники-слушатели, которые бот поднимает/останавливает разом.
+# (name, script): PID каждого лежит в <name>.lock (пишет singleton.acquire).
+LISTENERS = [
+    ("channels", "channels.py"),
+    ("weworkremotely", "weworkremotely.py"),
+    ("remoteok", "remoteok.py"),
+    ("hh", "hh.py"),
+]
 
 # Источники: ключ -> (ключ подписи, префикс id в БД)
 SOURCES = {
@@ -222,17 +229,9 @@ def set_lang(user_id, lang: str) -> None:
     os.replace(tmp, LANG_FILE)
 
 
-# --- Управление процессом ридера (channels.py) -----------------------------
+# --- Управление источниками (channels/weworkremotely/remoteok/hh) ----------
 
-_reader_proc = None  # Popen текущей сессии бота (для корректной reaping зомби)
-
-
-def _read_pid():
-    try:
-        with open(PID_FILE) as f:
-            return int(f.read().strip())
-    except (OSError, ValueError):
-        return None
+_procs = {}  # name -> Popen текущей сессии бота (для reaping зомби)
 
 
 def _alive(pid: int) -> bool:
@@ -243,74 +242,73 @@ def _alive(pid: int) -> bool:
         return False
 
 
-def reader_running() -> bool:
-    global _reader_proc
-    if _reader_proc is not None:
-        if _reader_proc.poll() is None:
-            return True
-        _reader_proc = None
-    pid = _read_pid()
+def _lock_pid(name: str):
+    """PID процесса-слушателя из его lock-файла <name>.lock (пишет singleton)."""
+    try:
+        with open(f"{name}.lock") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _running(name: str) -> bool:
+    pid = _lock_pid(name)
     return bool(pid and _alive(pid))
 
 
-def start_reader(lang: str) -> str:
-    global _reader_proc
-    if reader_running():
-        return t(lang, "already_running")
-
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    log = open(LOG_FILE, "a")
-    _reader_proc = subprocess.Popen(
-        READER_CMD, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
-    )
-    with open(PID_FILE, "w") as f:
-        f.write(str(_reader_proc.pid))
-    return t(lang, "started", pid=_reader_proc.pid)
+def running_count() -> int:
+    return sum(1 for name, _ in LISTENERS if _running(name))
 
 
-def stop_reader(lang: str) -> str:
-    global _reader_proc
+def start_listeners() -> list:
+    """Поднять все источники, которые ещё не работают. Дубли отсекает их lock."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    started = []
+    for name, script in LISTENERS:
+        if _running(name):
+            continue
+        log = open(os.path.join(LOG_DIR, f"{name}.log"), "a")
+        _procs[name] = subprocess.Popen(
+            [sys.executable, script],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        started.append(name)
+    return started
 
-    if _reader_proc is not None and _reader_proc.poll() is None:
-        _reader_proc.terminate()
-        try:
-            _reader_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _reader_proc.kill()
-        _reader_proc = None
-        _cleanup_pid()
-        return t(lang, "stopped")
 
-    pid = _read_pid()
-    if pid and _alive(pid):
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except OSError:
+def stop_listeners() -> list:
+    """Остановить все источники: и детей этой сессии, и осиротевших (по lock-PID)."""
+    stopped = []
+    for name, _ in LISTENERS:
+        was = _running(name) or name in _procs
+        p = _procs.pop(name, None)
+        if p is not None and p.poll() is None:
+            p.terminate()
             try:
-                os.kill(pid, signal.SIGTERM)
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        pid = _lock_pid(name)
+        if pid and _alive(pid):
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
             except OSError:
-                pass
-        _cleanup_pid()
-        _reader_proc = None
-        return t(lang, "stopped")
-
-    _cleanup_pid()
-    _reader_proc = None
-    return t(lang, "not_running")
-
-
-def _cleanup_pid():
-    try:
-        os.remove(PID_FILE)
-    except OSError:
-        pass
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        if was:
+            stopped.append(name)
+    return stopped
 
 
 # --- Тексты ----------------------------------------------------------------
 
 def short_status(lang: str) -> str:
-    state = t(lang, "st_on") if reader_running() else t(lang, "st_off")
-    return f"{t(lang, 'st_monitoring')}: {state}"
+    n = running_count()
+    total = len(LISTENERS)
+    state = t(lang, "st_on") if n else t(lang, "st_off")
+    return f"{t(lang, 'st_monitoring')}: {state} ({n}/{total})"
 
 
 def format_vacancy(lang: str, row) -> str:
@@ -408,71 +406,112 @@ def _authorized(event) -> bool:
     return OWNER_ID is None or event.sender_id == OWNER_ID
 
 
+def _state(uid):
+    st = nav.setdefault(uid, {"menu": "main", "source": None, "msg": None})
+    st.setdefault("msg", None)
+    return st
+
+
+async def _clean(event, st):
+    """Убрать мусор навигации: удалить нажатие пользователя и прошлое меню-сообщение."""
+    try:
+        await event.delete()
+    except Exception:
+        pass
+    prev = st.get("msg")
+    if prev:
+        try:
+            await bot.delete_messages(event.chat_id, prev)
+        except Exception:
+            pass
+        st["msg"] = None
+
+
+async def _render(event, st, text, buttons):
+    """Показать экран навигации, не засоряя чат: чистим прошлое, шлём новое меню."""
+    await _clean(event, st)
+    m = await event.respond(text, buttons=buttons)
+    st["msg"] = m.id
+
+
 @bot.on(events.NewMessage(incoming=True))
 async def handler(event):
     if not _authorized(event):
         return
 
     uid = event.sender_id
+    st = _state(uid)
     token, arg = parse_nav(event.raw_text or "")
 
-    # Выбор языка обрабатываем ПЕРВЫМ — в т.ч. на онбординге, иначе проверка
-    # has_lang ниже перехватывала бы нажатие флага и зацикливала выбор языка.
+    # Выбор языка обрабатываем ПЕРВЫМ — в т.ч. на онбординге.
     if token == "setlang":
         set_lang(uid, arg)
-        nav.setdefault(uid, {"menu": "main", "source": None})["menu"] = "main"
-        await event.respond(t(arg, "m_title"), buttons=kb_main(arg))
+        st["menu"] = "main"
+        await _render(event, st, t(arg, "m_title"), kb_main(arg))
         return
 
     # Онбординг: пока язык не выбран — показываем выбор языка.
     if not has_lang(uid):
-        await event.respond(t(DEFAULT_LANG, "choose_lang"), buttons=kb_lang())
+        await _render(event, st, t(DEFAULT_LANG, "choose_lang"), kb_lang())
         return
 
     lang = get_lang(uid)
-    st = nav.setdefault(uid, {"menu": "main", "source": None})
+
+    if token is None:
+        # неизвестный ввод — просто убираем его, чтобы не мусорил в чате
+        try:
+            await event.delete()
+        except Exception:
+            pass
+        return
 
     if token == "menu":
         st["menu"] = "main"
-        await event.respond(t(lang, "m_title"), buttons=kb_main(lang))
+        await _render(event, st, t(lang, "m_title"), kb_main(lang))
     elif token == "control":
         st["menu"] = "control"
-        await event.respond(t(lang, "b_control"), buttons=kb_control(lang))
+        await _render(event, st, t(lang, "b_control"), kb_control(lang))
     elif token == "sources":
         st["menu"] = "sources"
-        await event.respond(t(lang, "sources_title"), buttons=kb_sources(lang))
+        await _render(event, st, t(lang, "sources_title"), kb_sources(lang))
     elif token == "lang":
-        await event.respond(t(lang, "choose_lang"), buttons=kb_lang())
+        await _render(event, st, t(lang, "choose_lang"), kb_lang())
     elif token == "help":
-        await event.respond(t(lang, "help"), buttons=kb_main(lang))
+        await _render(event, st, t(lang, "help"), kb_main(lang))
     elif token == "c_start":
         st["menu"] = "control"
-        await event.respond(start_reader(lang), buttons=kb_control(lang))
+        start_listeners()
+        await _render(event, st, short_status(lang), kb_control(lang))
     elif token == "c_stop":
         st["menu"] = "control"
-        await event.respond(stop_reader(lang), buttons=kb_control(lang))
+        stop_listeners()
+        await _render(event, st, short_status(lang), kb_control(lang))
     elif token == "c_restart":
         st["menu"] = "control"
-        stop_reader(lang)
-        await event.respond(start_reader(lang), buttons=kb_control(lang))
+        stop_listeners()
+        start_listeners()
+        await _render(event, st, short_status(lang), kb_control(lang))
     elif token == "c_status":
         st["menu"] = "control"
-        await event.respond(short_status(lang), buttons=kb_control(lang))
+        await _render(event, st, short_status(lang), kb_control(lang))
     elif token in ("src_channels", "src_remoteok", "src_wwr", "src_hh"):
         source = token[4:]
         st["source"] = source
         st["menu"] = "pagination"
         label = t(lang, SOURCES[source][0])
-        await event.respond(t(lang, "page_title", source=label), buttons=kb_pagination(lang))
+        await _render(event, st, t(lang, "page_title", source=label), kb_pagination(lang))
     elif token == "page":
         source = st.get("source")
         if not source:
             st["menu"] = "sources"
-            await event.respond(t(lang, "sources_title"), buttons=kb_sources(lang))
+            await _render(event, st, t(lang, "sources_title"), kb_sources(lang))
         else:
+            # чистим навигацию, но сами вакансии оставляем в чате
+            await _clean(event, st)
             rows = db.recent(arg, SOURCES[source][1])
             if not rows:
-                await event.respond(t(lang, "vac_empty"), buttons=kb_pagination(lang))
+                m = await event.respond(t(lang, "vac_empty"), buttons=kb_pagination(lang))
+                st["msg"] = m.id
             else:
                 for row in rows:
                     await event.respond(
@@ -483,11 +522,10 @@ async def handler(event):
     elif token == "back":
         if st.get("menu") == "pagination":
             st["menu"] = "sources"
-            await event.respond(t(lang, "sources_title"), buttons=kb_sources(lang))
+            await _render(event, st, t(lang, "sources_title"), kb_sources(lang))
         else:
             st["menu"] = "main"
-            await event.respond(t(lang, "m_title"), buttons=kb_main(lang))
-    # остальное игнорируем (без спама справкой)
+            await _render(event, st, t(lang, "m_title"), kb_main(lang))
 
 
 _instance_lock = None  # держим открытый файл, чтобы flock не снялся
@@ -528,8 +566,9 @@ def main():
     _ensure_single_instance()
     bot.start(bot_token=BOT_TOKEN)
     print("Control bot started.")
-    # Авто-старт слушателя каналов: новые вакансии форвардятся в n8n как раньше.
-    print(start_reader(DEFAULT_LANG))
+    # Авто-старт всех источников: вакансии форвардятся в n8n без ручного запуска.
+    started = start_listeners()
+    print("Источники запущены:", ", ".join(started) if started else "(уже работали)")
     bot.run_until_disconnected()
 
 

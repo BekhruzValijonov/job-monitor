@@ -1,15 +1,18 @@
 import os
+import sys
 import time
 import requests
 from dotenv import load_dotenv
 
 import db
+import singleton
 from filters import garbage_reason
 from seen_store import SeenStore
 
 load_dotenv()
 
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # период опроса, сек
 
 # HH блокирует "обобщённые"/известные UA (job-monitor/* отдаёт bad_user_agent).
 # Нужен уникальный, идентифицирующий приложение + контакт.
@@ -92,7 +95,7 @@ def send_to_n8n(vacancy: dict):
     )
 
 
-def main():
+def run_once():
     store = SeenStore("processed_hh.json")
 
     for query in SEARCH_QUERIES:
@@ -107,6 +110,23 @@ def main():
             store.add(key)
             send_to_n8n(vacancy)
             time.sleep(0.5)
+
+
+def main():
+    # Разовый прогон: python hh.py --once
+    if "--once" in sys.argv:
+        run_once()
+        return
+
+    # По умолчанию — слушаем в цикле, дубли отсекает seen_store.
+    singleton.acquire("hh.lock", "hh.py")
+    print(f"HH listener started (каждые {POLL_INTERVAL}s).")
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            print("Cycle error:", e)
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
