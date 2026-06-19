@@ -19,6 +19,7 @@
 import asyncio
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -49,7 +50,11 @@ TR = {
     "ru": {
         "b_start": "▶️ Старт", "b_stop": "⏸ Стоп", "b_restart": "🔄 Рестарт",
         "b_status": "📊 Статус", "b_hh": "🔎 HH", "b_remoteok": "🔎 RemoteOK",
+        "b_wwr": "🔎 WWR",
+        "b_vac5": "📋 5", "b_vac10": "📋 10", "b_vac15": "📋 15",
         "b_help": "❓ Помощь", "b_cancel": "✖️ Отмена", "b_lang": "🌐 Язык",
+        "vac_header": "📋 Последние вакансии:",
+        "vac_empty": "📭 Вакансий пока нет.",
         "already_running": "✅ Мониторинг уже запущен.",
         "started": "▶️ Мониторинг запущен (pid {pid}).",
         "stopped": "⏸ Мониторинг остановлен.",
@@ -70,6 +75,8 @@ TR = {
             "📊 Статус / /status — состояние и статистика\n"
             "🔎 HH / /hh — разовый поиск на HH\n"
             "🔎 RemoteOK / /remoteok — разовый поиск на RemoteOK\n"
+            "🔎 WWR / /wwr — разовый поиск на WeWorkRemotely\n"
+            "📋 5 / 10 / 15 — показать последние N вакансий\n"
             "❓ Помощь / /help — эта справка\n"
             "✖️ Отмена / /cancel — убрать клавиатуру\n"
             "🌐 Язык / /lang — сменить язык"
@@ -78,7 +85,11 @@ TR = {
     "uz": {
         "b_start": "▶️ Boshlash", "b_stop": "⏸ To'xtatish", "b_restart": "🔄 Qayta yuklash",
         "b_status": "📊 Holat", "b_hh": "🔎 HH", "b_remoteok": "🔎 RemoteOK",
+        "b_wwr": "🔎 WWR",
+        "b_vac5": "📋 5", "b_vac10": "📋 10", "b_vac15": "📋 15",
         "b_help": "❓ Yordam", "b_cancel": "✖️ Bekor qilish", "b_lang": "🌐 Til",
+        "vac_header": "📋 Oxirgi vakansiyalar:",
+        "vac_empty": "📭 Hozircha vakansiya yo'q.",
         "already_running": "✅ Monitoring allaqachon ishlamoqda.",
         "started": "▶️ Monitoring ishga tushdi (pid {pid}).",
         "stopped": "⏸ Monitoring to'xtatildi.",
@@ -99,6 +110,8 @@ TR = {
             "📊 Holat / /status — holat va statistika\n"
             "🔎 HH / /hh — HH bo'yicha bir martalik qidiruv\n"
             "🔎 RemoteOK / /remoteok — RemoteOK bo'yicha bir martalik qidiruv\n"
+            "🔎 WWR / /wwr — WeWorkRemotely bo'yicha bir martalik qidiruv\n"
+            "📋 5 / 10 / 15 — oxirgi N ta vakansiyani ko'rsatish\n"
             "❓ Yordam / /help — ushbu yordam\n"
             "✖️ Bekor qilish / /cancel — klaviaturani yashirish\n"
             "🌐 Til / /lang — tilni o'zgartirish"
@@ -107,7 +120,11 @@ TR = {
     "en": {
         "b_start": "▶️ Start", "b_stop": "⏸ Stop", "b_restart": "🔄 Restart",
         "b_status": "📊 Status", "b_hh": "🔎 HH", "b_remoteok": "🔎 RemoteOK",
+        "b_wwr": "🔎 WWR",
+        "b_vac5": "📋 5", "b_vac10": "📋 10", "b_vac15": "📋 15",
         "b_help": "❓ Help", "b_cancel": "✖️ Cancel", "b_lang": "🌐 Language",
+        "vac_header": "📋 Latest vacancies:",
+        "vac_empty": "📭 No vacancies yet.",
         "already_running": "✅ Monitoring is already running.",
         "started": "▶️ Monitoring started (pid {pid}).",
         "stopped": "⏸ Monitoring stopped.",
@@ -128,6 +145,8 @@ TR = {
             "📊 Status / /status — state and statistics\n"
             "🔎 HH / /hh — one-off HH search\n"
             "🔎 RemoteOK / /remoteok — one-off RemoteOK search\n"
+            "🔎 WWR / /wwr — one-off WeWorkRemotely search\n"
+            "📋 5 / 10 / 15 — show latest N vacancies\n"
             "❓ Help / /help — this help\n"
             "✖️ Cancel / /cancel — hide the keyboard\n"
             "🌐 Language / /lang — change language"
@@ -143,12 +162,18 @@ def t(lang: str, key: str, **kwargs) -> str:
 
 
 def keyboard(lang: str):
+    b = lambda key: Button.text(t(lang, key), resize=True)
     return [
-        [Button.text(t(lang, "b_start"), resize=True), Button.text(t(lang, "b_stop"), resize=True)],
-        [Button.text(t(lang, "b_restart"), resize=True), Button.text(t(lang, "b_status"), resize=True)],
-        [Button.text(t(lang, "b_hh"), resize=True), Button.text(t(lang, "b_remoteok"), resize=True)],
-        [Button.text(t(lang, "b_help"), resize=True), Button.text(t(lang, "b_cancel"), resize=True)],
-        [Button.text(t(lang, "b_lang"), resize=True)],
+        # Управление мониторингом
+        [b("b_start"), b("b_stop"), b("b_restart")],
+        # Информация
+        [b("b_status"), b("b_help")],
+        # Вакансии (пагинация)
+        [b("b_vac5"), b("b_vac10"), b("b_vac15")],
+        # Источники
+        [b("b_hh"), b("b_remoteok"), b("b_wwr")],
+        # Прочее
+        [b("b_lang"), b("b_cancel")],
     ]
 
 
@@ -174,6 +199,10 @@ def _load_langs() -> dict:
 
 def get_lang(user_id) -> str:
     return _load_langs().get(str(user_id), DEFAULT_LANG)
+
+
+def has_lang(user_id) -> bool:
+    return str(user_id) in _load_langs()
 
 
 def set_lang(user_id, lang: str) -> None:
@@ -275,7 +304,7 @@ def _cleanup_pid():
 async def run_script(name: str, lang: str) -> str:
     try:
         proc = await asyncio.to_thread(
-            subprocess.run, [sys.executable, name],
+            subprocess.run, [sys.executable, name, "--once"],
             capture_output=True, text=True, timeout=300,
         )
     except subprocess.TimeoutExpired:
@@ -284,6 +313,17 @@ async def run_script(name: str, lang: str) -> str:
     out = (proc.stdout or "") + (proc.stderr or "")
     tail = out.strip().splitlines()[-15:]
     return t(lang, "done", name=name, code=proc.returncode) + "\n" + "\n".join(tail)
+
+
+def vacancies_text(lang: str, count: int) -> str:
+    rows = db.recent(count)
+    if not rows:
+        return t(lang, "vac_empty")
+    lines = [t(lang, "vac_header")]
+    for i, (title, channel, url, score, _created) in enumerate(rows, 1):
+        star = f" ⭐ {score}" if score is not None else ""
+        lines.append(f"{i}. {title or '—'} — {channel or '—'}{star}\n{url or ''}")
+    return "\n\n".join(lines)
 
 
 def status_text(lang: str) -> str:
@@ -308,8 +348,12 @@ def parse_action(text: str):
 
     if "🌐" in raw or low.startswith(("/lang", "/language")):
         return "lang"
+    if "📋" in raw or low.startswith(("/vac", "/vacancies")):
+        return "vac"
     if "remoteok" in low:
         return "remoteok"
+    if "wwr" in low or "weworkremotely" in low:
+        return "wwr"
     if "🔎" in raw and "hh" in low or low.startswith("/hh"):
         return "hh"
     for emoji, action in (
@@ -333,6 +377,13 @@ def parse_action(text: str):
     return None
 
 
+def parse_count(text: str) -> int:
+    """Сколько вакансий показать: 5/10/15 из текста кнопки, по умолчанию 5."""
+    m = re.search(r"\d+", text)
+    n = int(m.group()) if m else 5
+    return n if n in (5, 10, 15) else 5
+
+
 def _authorized(event) -> bool:
     return OWNER_ID is None or event.sender_id == OWNER_ID
 
@@ -349,13 +400,21 @@ async def on_lang(event):
     await event.respond(t(lang, "lang_set"), buttons=keyboard(lang))
 
 
-@bot.on(events.NewMessage)
+@bot.on(events.NewMessage(incoming=True))
 async def handler(event):
     if not _authorized(event):
         return
 
+    # Онбординг: пока язык не выбран — сначала показываем выбор языка.
+    if not has_lang(event.sender_id):
+        await event.respond(t(DEFAULT_LANG, "choose_lang"), buttons=LANG_BUTTONS)
+        return
+
     lang = get_lang(event.sender_id)
     action = parse_action(event.raw_text or "")
+
+    if action is None:
+        return  # нераспознанные сообщения игнорируем (не спамим справкой)
 
     if action == "start":
         await event.respond(start_reader(lang), buttons=keyboard(lang))
@@ -372,14 +431,21 @@ async def handler(event):
     elif action == "remoteok":
         await event.respond(t(lang, "running", name="remoteok.py"))
         await event.respond(await run_script("remoteok.py", lang), buttons=keyboard(lang))
+    elif action == "wwr":
+        await event.respond(t(lang, "running", name="weworkremotely.py"))
+        await event.respond(await run_script("weworkremotely.py", lang), buttons=keyboard(lang))
+    elif action == "vac":
+        await event.respond(
+            vacancies_text(lang, parse_count(event.raw_text or "")),
+            buttons=keyboard(lang),
+            link_preview=False,
+        )
     elif action == "help":
         await event.respond(t(lang, "help"), buttons=keyboard(lang))
     elif action == "cancel":
         await event.respond(t(lang, "cancelled"), buttons=Button.clear())
     elif action == "lang":
         await event.respond(t(lang, "choose_lang"), buttons=LANG_BUTTONS)
-    else:
-        await event.respond(t(lang, "help"), buttons=keyboard(lang))
 
 
 def main():

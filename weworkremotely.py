@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 import html
 import xml.etree.ElementTree as ET
@@ -15,6 +16,7 @@ load_dotenv()
 
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 DRY_RUN = os.getenv("DRY_RUN") == "1"  # 1 — не слать в n8n, только печатать
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # период опроса RSS, сек
 
 USER_AGENT = "vacancy-bot/1.0 (sxmebytes@gmail.com)"
 
@@ -132,7 +134,7 @@ def send_to_n8n(job: dict):
     )
 
 
-def main():
+def run_once():
     store = SeenStore("processed_weworkremotely.json")
     total = 0
     relevant = 0
@@ -157,6 +159,23 @@ def main():
             time.sleep(0.3)
 
     print(f"Done. Total: {total}, relevant new: {relevant}")
+    return relevant
+
+
+def main():
+    # Разовый прогон (для кнопки в боте): python weworkremotely.py --once
+    if "--once" in sys.argv:
+        run_once()
+        return
+
+    # По умолчанию — слушаем RSS в цикле, дубли отсекает seen_store.
+    print(f"WeWorkRemotely listener started (каждые {POLL_INTERVAL}s).")
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            print("Cycle error:", e)
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":

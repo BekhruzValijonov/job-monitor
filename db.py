@@ -61,6 +61,21 @@ def save_vacancy(vacancy_id, channel, title, url, score=None, decision=None):
             conn.close()
 
 
+def recent(limit: int):
+    """Последние вакансии (для пагинации в боте): title, channel, url, score."""
+    conn = _connect()
+    try:
+        return conn.execute(
+            """
+            SELECT title, channel, url, score, created_at
+            FROM vacancies ORDER BY created_at DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
 def stats() -> dict:
     """Сводка для команды /status: всего, по каналам, время последней записи."""
     conn = _connect()
