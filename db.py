@@ -61,10 +61,22 @@ def save_vacancy(vacancy_id, channel, title, url, score=None, decision=None):
             conn.close()
 
 
-def recent(limit: int):
-    """Последние вакансии (для пагинации в боте): title, channel, url, score."""
+def recent(limit: int, prefix: str = None):
+    """Последние вакансии (для пагинации в боте): title, channel, url, score.
+
+    prefix — фильтр по источнику через префикс id (telegram_/hh_/remoteok_/wwr_).
+    """
     conn = _connect()
     try:
+        if prefix:
+            return conn.execute(
+                """
+                SELECT title, channel, url, score, created_at
+                FROM vacancies WHERE id LIKE ?
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (prefix + "%", limit),
+            ).fetchall()
         return conn.execute(
             """
             SELECT title, channel, url, score, created_at

@@ -1,31 +1,27 @@
-"""Управляющий Телеграм-бот (мультиязычный: ru / uz / en).
+"""Управляющий Телеграм-бот (мультиязычный: ru / uz / en) с вложенным меню.
 
-Кнопки и команды для управления пайплайном вакансий:
-  /start    — запустить мониторинг каналов (main.py)
-  /stop     — остановить мониторинг
-  /restart  — перезапустить мониторинг
-  /status   — статус + статистика из БД
-  /hh       — разовый прогон hh.py
-  /remoteok — разовый прогон remoteok.py
-  /help     — справка
-  /cancel   — убрать клавиатуру
-  /lang     — выбрать язык
+Навигация (inline-кнопки):
+  /start → Главное меню
+    ├─ 🛠 Управление ботом → Старт / Стоп / Рестарт / Статус
+    ├─ 📋 Вакансии → источник (Каналы / RemoteOK / WWR / HH)
+    │                  └─ источник → пагинация 5 / 10 / 15 → список вакансий
+    ├─ 🌐 Язык
+    └─ ❓ Помощь
 
-Запуск: python bot.py  (нужен BOT_TOKEN от @BotFather в .env)
-Доступ ограничен OWNER_ID (если задан). Язык выбирается кнопкой 🌐 и
-хранится по пользователю в settings.json.
+Запуск: python bot.py  (или python main.py). Нужен BOT_TOKEN от @BotFather.
+Доступ ограничен OWNER_ID (если задан). Чтение Telegram-каналов — channels.py,
+его запускает кнопка «Старт» (pid в reader.pid, лог в logs/reader.log).
 """
 
-import asyncio
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
 
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
+from telethon.errors import MessageNotModifiedError
 
 import db
 
@@ -40,6 +36,15 @@ PID_FILE = "reader.pid"
 LOG_FILE = "logs/reader.log"
 LANG_FILE = "settings.json"
 DEFAULT_LANG = "ru"
+READER_CMD = [sys.executable, "channels.py"]
+
+# Источники вакансий: ключ -> (подпись, префикс id в БД)
+SOURCES = {
+    "channels": ("src_channels", "telegram_"),
+    "remoteok": ("src_remoteok", "remoteok_"),
+    "wwr": ("src_wwr", "wwr_"),
+    "hh": ("src_hh", "hh_"),
+}
 
 bot = TelegramClient("vacancy_bot_session", API_ID, API_HASH)
 
@@ -48,108 +53,87 @@ bot = TelegramClient("vacancy_bot_session", API_ID, API_HASH)
 
 TR = {
     "ru": {
-        "b_start": "▶️ Старт", "b_stop": "⏸ Стоп", "b_restart": "🔄 Рестарт",
-        "b_status": "📊 Статус", "b_hh": "🔎 HH", "b_remoteok": "🔎 RemoteOK",
-        "b_wwr": "🔎 WWR",
-        "b_vac5": "📋 5", "b_vac10": "📋 10", "b_vac15": "📋 15",
-        "b_help": "❓ Помощь", "b_cancel": "✖️ Отмена", "b_lang": "🌐 Язык",
-        "vac_header": "📋 Последние вакансии:",
+        "m_title": "🤖 Главное меню",
+        "b_control": "🛠 Управление ботом", "b_sources": "📋 Вакансии",
+        "b_lang": "🌐 Язык", "b_help": "❓ Помощь", "b_back": "⬅️ Назад",
+        "b_start": "▶️ Старт", "b_stop": "⏸ Стоп",
+        "b_restart": "🔄 Рестарт", "b_status": "📊 Статус",
+        "src_channels": "📨 Каналы", "src_remoteok": "🌐 RemoteOK",
+        "src_wwr": "💼 WWR", "src_hh": "🔎 HH",
+        "sources_title": "📋 Выберите источник:",
+        "page_title": "📋 {source}: сколько вакансий показать?",
+        "vac_header": "📋 Последние вакансии — {source}:",
         "vac_empty": "📭 Вакансий пока нет.",
         "already_running": "✅ Мониторинг уже запущен.",
         "started": "▶️ Мониторинг запущен (pid {pid}).",
         "stopped": "⏸ Мониторинг остановлен.",
         "not_running": "⏸ Мониторинг не запущен.",
-        "cancelled": "✖️ Отменено.",
-        "running": "⏳ Запускаю {name}…",
-        "done": "🔎 `{name}` завершён (код {code}):",
-        "timeout": "⏱ {name}: превышено время ожидания.",
         "choose_lang": "🌐 Выберите язык:",
-        "lang_set": "🌐 Язык: Русский",
         "st_monitoring": "Мониторинг", "st_on": "▶️ запущен", "st_off": "⏸ остановлен",
         "st_total": "Вакансий в БД", "st_last": "Последняя", "st_by_channel": "По каналам",
         "help": (
-            "🤖 *Управление вакансий-ботом*\n\n"
-            "▶️ Старт / /start — запустить мониторинг каналов\n"
-            "⏸ Стоп / /stop — остановить мониторинг\n"
-            "🔄 Рестарт / /restart — перезапустить мониторинг\n"
-            "📊 Статус / /status — состояние и статистика\n"
-            "🔎 HH / /hh — разовый поиск на HH\n"
-            "🔎 RemoteOK / /remoteok — разовый поиск на RemoteOK\n"
-            "🔎 WWR / /wwr — разовый поиск на WeWorkRemotely\n"
-            "📋 5 / 10 / 15 — показать последние N вакансий\n"
-            "❓ Помощь / /help — эта справка\n"
-            "✖️ Отмена / /cancel — убрать клавиатуру\n"
-            "🌐 Язык / /lang — сменить язык"
+            "🤖 *Меню бота*\n\n"
+            "🛠 Управление ботом — запуск/стоп/рестарт/статус мониторинга\n"
+            "📋 Вакансии — выбрать источник и посмотреть последние вакансии\n"
+            "🌐 Язык — сменить язык\n\n"
+            "Команды: /start — меню, /stop — стоп, /status — статус, "
+            "/restart — рестарт, /help — справка, /lang — язык"
         ),
     },
     "uz": {
-        "b_start": "▶️ Boshlash", "b_stop": "⏸ To'xtatish", "b_restart": "🔄 Qayta yuklash",
-        "b_status": "📊 Holat", "b_hh": "🔎 HH", "b_remoteok": "🔎 RemoteOK",
-        "b_wwr": "🔎 WWR",
-        "b_vac5": "📋 5", "b_vac10": "📋 10", "b_vac15": "📋 15",
-        "b_help": "❓ Yordam", "b_cancel": "✖️ Bekor qilish", "b_lang": "🌐 Til",
-        "vac_header": "📋 Oxirgi vakansiyalar:",
+        "m_title": "🤖 Asosiy menyu",
+        "b_control": "🛠 Botni boshqarish", "b_sources": "📋 Vakansiyalar",
+        "b_lang": "🌐 Til", "b_help": "❓ Yordam", "b_back": "⬅️ Orqaga",
+        "b_start": "▶️ Boshlash", "b_stop": "⏸ To'xtatish",
+        "b_restart": "🔄 Qayta yuklash", "b_status": "📊 Holat",
+        "src_channels": "📨 Kanallar", "src_remoteok": "🌐 RemoteOK",
+        "src_wwr": "💼 WWR", "src_hh": "🔎 HH",
+        "sources_title": "📋 Manbani tanlang:",
+        "page_title": "📋 {source}: nechta vakansiya ko'rsatilsin?",
+        "vac_header": "📋 Oxirgi vakansiyalar — {source}:",
         "vac_empty": "📭 Hozircha vakansiya yo'q.",
         "already_running": "✅ Monitoring allaqachon ishlamoqda.",
         "started": "▶️ Monitoring ishga tushdi (pid {pid}).",
         "stopped": "⏸ Monitoring to'xtatildi.",
         "not_running": "⏸ Monitoring ishlamayapti.",
-        "cancelled": "✖️ Bekor qilindi.",
-        "running": "⏳ {name} ishga tushyapti…",
-        "done": "🔎 `{name}` tugadi (kod {code}):",
-        "timeout": "⏱ {name}: kutish vaqti tugadi.",
         "choose_lang": "🌐 Tilni tanlang:",
-        "lang_set": "🌐 Til: O'zbekcha",
         "st_monitoring": "Monitoring", "st_on": "▶️ ishlamoqda", "st_off": "⏸ to'xtagan",
         "st_total": "Bazadagi vakansiyalar", "st_last": "Oxirgi", "st_by_channel": "Kanallar bo'yicha",
         "help": (
-            "🤖 *Vakansiya-botni boshqarish*\n\n"
-            "▶️ Boshlash / /start — kanallar monitoringini ishga tushirish\n"
-            "⏸ To'xtatish / /stop — monitoringni to'xtatish\n"
-            "🔄 Qayta yuklash / /restart — monitoringni qayta ishga tushirish\n"
-            "📊 Holat / /status — holat va statistika\n"
-            "🔎 HH / /hh — HH bo'yicha bir martalik qidiruv\n"
-            "🔎 RemoteOK / /remoteok — RemoteOK bo'yicha bir martalik qidiruv\n"
-            "🔎 WWR / /wwr — WeWorkRemotely bo'yicha bir martalik qidiruv\n"
-            "📋 5 / 10 / 15 — oxirgi N ta vakansiyani ko'rsatish\n"
-            "❓ Yordam / /help — ushbu yordam\n"
-            "✖️ Bekor qilish / /cancel — klaviaturani yashirish\n"
-            "🌐 Til / /lang — tilni o'zgartirish"
+            "🤖 *Bot menyusi*\n\n"
+            "🛠 Botni boshqarish — monitoringni ishga tushirish/to'xtatish/holat\n"
+            "📋 Vakansiyalar — manbani tanlab oxirgi vakansiyalarni ko'rish\n"
+            "🌐 Til — tilni o'zgartirish\n\n"
+            "Buyruqlar: /start — menyu, /stop — to'xtatish, /status — holat, "
+            "/restart — qayta yuklash, /help — yordam, /lang — til"
         ),
     },
     "en": {
-        "b_start": "▶️ Start", "b_stop": "⏸ Stop", "b_restart": "🔄 Restart",
-        "b_status": "📊 Status", "b_hh": "🔎 HH", "b_remoteok": "🔎 RemoteOK",
-        "b_wwr": "🔎 WWR",
-        "b_vac5": "📋 5", "b_vac10": "📋 10", "b_vac15": "📋 15",
-        "b_help": "❓ Help", "b_cancel": "✖️ Cancel", "b_lang": "🌐 Language",
-        "vac_header": "📋 Latest vacancies:",
+        "m_title": "🤖 Main menu",
+        "b_control": "🛠 Bot control", "b_sources": "📋 Vacancies",
+        "b_lang": "🌐 Language", "b_help": "❓ Help", "b_back": "⬅️ Back",
+        "b_start": "▶️ Start", "b_stop": "⏸ Stop",
+        "b_restart": "🔄 Restart", "b_status": "📊 Status",
+        "src_channels": "📨 Channels", "src_remoteok": "🌐 RemoteOK",
+        "src_wwr": "💼 WWR", "src_hh": "🔎 HH",
+        "sources_title": "📋 Choose a source:",
+        "page_title": "📋 {source}: how many vacancies to show?",
+        "vac_header": "📋 Latest vacancies — {source}:",
         "vac_empty": "📭 No vacancies yet.",
         "already_running": "✅ Monitoring is already running.",
         "started": "▶️ Monitoring started (pid {pid}).",
         "stopped": "⏸ Monitoring stopped.",
         "not_running": "⏸ Monitoring is not running.",
-        "cancelled": "✖️ Cancelled.",
-        "running": "⏳ Running {name}…",
-        "done": "🔎 `{name}` finished (code {code}):",
-        "timeout": "⏱ {name}: timed out.",
         "choose_lang": "🌐 Choose language:",
-        "lang_set": "🌐 Language: English",
         "st_monitoring": "Monitoring", "st_on": "▶️ running", "st_off": "⏸ stopped",
         "st_total": "Vacancies in DB", "st_last": "Last", "st_by_channel": "By channel",
         "help": (
-            "🤖 *Vacancy bot control*\n\n"
-            "▶️ Start / /start — start channel monitoring\n"
-            "⏸ Stop / /stop — stop monitoring\n"
-            "🔄 Restart / /restart — restart monitoring\n"
-            "📊 Status / /status — state and statistics\n"
-            "🔎 HH / /hh — one-off HH search\n"
-            "🔎 RemoteOK / /remoteok — one-off RemoteOK search\n"
-            "🔎 WWR / /wwr — one-off WeWorkRemotely search\n"
-            "📋 5 / 10 / 15 — show latest N vacancies\n"
-            "❓ Help / /help — this help\n"
-            "✖️ Cancel / /cancel — hide the keyboard\n"
-            "🌐 Language / /lang — change language"
+            "🤖 *Bot menu*\n\n"
+            "🛠 Bot control — start/stop/restart/status of monitoring\n"
+            "📋 Vacancies — pick a source and view the latest vacancies\n"
+            "🌐 Language — change language\n\n"
+            "Commands: /start — menu, /stop — stop, /status — status, "
+            "/restart — restart, /help — help, /lang — language"
         ),
     },
 }
@@ -161,22 +145,6 @@ def t(lang: str, key: str, **kwargs) -> str:
     return text.format(**kwargs) if kwargs else text
 
 
-def keyboard(lang: str):
-    b = lambda key: Button.text(t(lang, key), resize=True)
-    return [
-        # Управление мониторингом
-        [b("b_start"), b("b_stop"), b("b_restart")],
-        # Информация
-        [b("b_status"), b("b_help")],
-        # Вакансии (пагинация)
-        [b("b_vac5"), b("b_vac10"), b("b_vac15")],
-        # Источники
-        [b("b_hh"), b("b_remoteok"), b("b_wwr")],
-        # Прочее
-        [b("b_lang"), b("b_cancel")],
-    ]
-
-
 LANG_BUTTONS = [
     [
         Button.inline("🇷🇺 Русский", b"lang_ru"),
@@ -184,6 +152,71 @@ LANG_BUTTONS = [
         Button.inline("🇬🇧 English", b"lang_en"),
     ]
 ]
+
+
+# --- Меню (inline) ---------------------------------------------------------
+
+def menu_main(lang):
+    buttons = [
+        [Button.inline(t(lang, "b_control"), b"m_control")],
+        [Button.inline(t(lang, "b_sources"), b"m_sources")],
+        [Button.inline(t(lang, "b_lang"), b"m_lang"),
+         Button.inline(t(lang, "b_help"), b"m_help")],
+    ]
+    return t(lang, "m_title"), buttons
+
+
+def menu_control(lang):
+    buttons = [
+        [Button.inline(t(lang, "b_start"), b"c_start"),
+         Button.inline(t(lang, "b_stop"), b"c_stop")],
+        [Button.inline(t(lang, "b_restart"), b"c_restart"),
+         Button.inline(t(lang, "b_status"), b"c_status")],
+        [Button.inline(t(lang, "b_back"), b"m_main")],
+    ]
+    return f"{t(lang, 'b_control')}\n\n{status_text(lang)}", buttons
+
+
+def menu_sources(lang):
+    buttons = [
+        [Button.inline(t(lang, "src_channels"), b"s_channels"),
+         Button.inline(t(lang, "src_remoteok"), b"s_remoteok")],
+        [Button.inline(t(lang, "src_wwr"), b"s_wwr"),
+         Button.inline(t(lang, "src_hh"), b"s_hh")],
+        [Button.inline(t(lang, "b_back"), b"m_main")],
+    ]
+    return t(lang, "sources_title"), buttons
+
+
+def _pagination_rows(source):
+    return [
+        Button.inline("📋 5", f"p_{source}_5".encode()),
+        Button.inline("📋 10", f"p_{source}_10".encode()),
+        Button.inline("📋 15", f"p_{source}_15".encode()),
+    ]
+
+
+def menu_pagination(lang, source):
+    label = t(lang, SOURCES[source][0])
+    buttons = [
+        _pagination_rows(source),
+        [Button.inline(t(lang, "b_back"), b"m_sources")],
+    ]
+    return t(lang, "page_title", source=label), buttons
+
+
+def view_vacancies(lang, source, count):
+    label = t(lang, SOURCES[source][0])
+    text = vacancies_text(lang, count, label, SOURCES[source][1])
+    buttons = [
+        _pagination_rows(source),
+        [Button.inline(t(lang, "b_back"), b"m_sources")],
+    ]
+    return text, buttons
+
+
+def menu_help(lang):
+    return t(lang, "help"), [[Button.inline(t(lang, "b_back"), b"m_main")]]
 
 
 # --- Выбор языка (персистентно, по пользователю) ---------------------------
@@ -214,9 +247,8 @@ def set_lang(user_id, lang: str) -> None:
     os.replace(tmp, LANG_FILE)
 
 
-# --- Управление процессом ридера (main.py) ---------------------------------
+# --- Управление процессом ридера (channels.py) -----------------------------
 
-READER_CMD = [sys.executable, "main.py"]
 _reader_proc = None  # Popen текущей сессии бота (для корректной reaping зомби)
 
 
@@ -299,27 +331,13 @@ def _cleanup_pid():
         pass
 
 
-# --- Разовые фетчеры (hh.py / remoteok.py) ---------------------------------
+# --- Тексты ----------------------------------------------------------------
 
-async def run_script(name: str, lang: str) -> str:
-    try:
-        proc = await asyncio.to_thread(
-            subprocess.run, [sys.executable, name, "--once"],
-            capture_output=True, text=True, timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        return t(lang, "timeout", name=name)
-
-    out = (proc.stdout or "") + (proc.stderr or "")
-    tail = out.strip().splitlines()[-15:]
-    return t(lang, "done", name=name, code=proc.returncode) + "\n" + "\n".join(tail)
-
-
-def vacancies_text(lang: str, count: int) -> str:
-    rows = db.recent(count)
+def vacancies_text(lang: str, count: int, source_label: str, prefix: str) -> str:
+    rows = db.recent(count, prefix)
     if not rows:
         return t(lang, "vac_empty")
-    lines = [t(lang, "vac_header")]
+    lines = [t(lang, "vac_header", source=source_label)]
     for i, (title, channel, url, score, _created) in enumerate(rows, 1):
         star = f" ⭐ {score}" if score is not None else ""
         lines.append(f"{i}. {title or '—'} — {channel or '—'}{star}\n{url or ''}")
@@ -338,66 +356,71 @@ def status_text(lang: str) -> str:
     return "\n".join(lines)
 
 
-# --- Роутинг ---------------------------------------------------------------
-
-def parse_action(text: str):
-    """Определить действие. Эмодзи одинаковы во всех языках, поэтому роутинг
-    не зависит от выбранного языка; источники различаем по токенам hh/remoteok."""
-    raw = text.strip()
-    low = raw.lower()
-
-    if "🌐" in raw or low.startswith(("/lang", "/language")):
-        return "lang"
-    if "📋" in raw or low.startswith(("/vac", "/vacancies")):
-        return "vac"
-    if "remoteok" in low:
-        return "remoteok"
-    if "wwr" in low or "weworkremotely" in low:
-        return "wwr"
-    if "🔎" in raw and "hh" in low or low.startswith("/hh"):
-        return "hh"
-    for emoji, action in (
-        ("🔄", "restart"), ("▶️", "start"), ("⏸", "stop"),
-        ("📊", "status"), ("❓", "help"), ("✖️", "cancel"),
-    ):
-        if emoji in raw:
-            return action
-    if low.startswith("/restart"):
-        return "restart"
-    if low.startswith("/start"):
-        return "start"
-    if low.startswith("/stop"):
-        return "stop"
-    if low.startswith("/status"):
-        return "status"
-    if low.startswith("/help"):
-        return "help"
-    if low.startswith("/cancel"):
-        return "cancel"
-    return None
-
-
-def parse_count(text: str) -> int:
-    """Сколько вакансий показать: 5/10/15 из текста кнопки, по умолчанию 5."""
-    m = re.search(r"\d+", text)
-    n = int(m.group()) if m else 5
-    return n if n in (5, 10, 15) else 5
-
+# --- Хендлеры --------------------------------------------------------------
 
 def _authorized(event) -> bool:
     return OWNER_ID is None or event.sender_id == OWNER_ID
 
 
-@bot.on(events.CallbackQuery(pattern=b"lang_"))
-async def on_lang(event):
+async def _edit(event, text, buttons):
+    try:
+        await event.edit(text, buttons=buttons, link_preview=False)
+    except MessageNotModifiedError:
+        pass
+
+
+@bot.on(events.CallbackQuery)
+async def on_callback(event):
     if not _authorized(event):
         return
-    lang = event.data.decode().split("_", 1)[1]
-    if lang not in TR:
-        lang = DEFAULT_LANG
-    set_lang(event.sender_id, lang)
-    await event.answer()
-    await event.respond(t(lang, "lang_set"), buttons=keyboard(lang))
+
+    data = event.data.decode()
+
+    # Выбор языка
+    if data.startswith("lang_"):
+        lang = data.split("_", 1)[1]
+        if lang not in TR:
+            lang = DEFAULT_LANG
+        set_lang(event.sender_id, lang)
+        await event.answer()
+        await _edit(event, *menu_main(lang))
+        return
+
+    lang = get_lang(event.sender_id)
+
+    if data == "m_main":
+        await _edit(event, *menu_main(lang))
+    elif data == "m_control":
+        await _edit(event, *menu_control(lang))
+    elif data == "m_sources":
+        await _edit(event, *menu_sources(lang))
+    elif data == "m_lang":
+        await _edit(event, t(lang, "choose_lang"), LANG_BUTTONS)
+    elif data == "m_help":
+        await _edit(event, *menu_help(lang))
+    elif data == "c_start":
+        await event.answer(start_reader(lang))
+        await _edit(event, *menu_control(lang))
+    elif data == "c_stop":
+        await event.answer(stop_reader(lang))
+        await _edit(event, *menu_control(lang))
+    elif data == "c_restart":
+        stop_reader(lang)
+        await event.answer(start_reader(lang))
+        await _edit(event, *menu_control(lang))
+    elif data == "c_status":
+        await event.answer()
+        await _edit(event, *menu_control(lang))
+    elif data.startswith("s_"):
+        source = data[2:]
+        if source in SOURCES:
+            await event.answer()
+            await _edit(event, *menu_pagination(lang, source))
+    elif data.startswith("p_"):
+        _, source, count = data.split("_", 2)
+        if source in SOURCES:
+            await event.answer()
+            await _edit(event, *view_vacancies(lang, source, int(count)))
 
 
 @bot.on(events.NewMessage(incoming=True))
@@ -405,47 +428,35 @@ async def handler(event):
     if not _authorized(event):
         return
 
-    # Онбординг: пока язык не выбран — сначала показываем выбор языка.
+    # Онбординг: пока язык не выбран — сначала выбор языка.
     if not has_lang(event.sender_id):
         await event.respond(t(DEFAULT_LANG, "choose_lang"), buttons=LANG_BUTTONS)
         return
 
     lang = get_lang(event.sender_id)
-    action = parse_action(event.raw_text or "")
+    text = (event.raw_text or "").strip().lower()
 
-    if action is None:
-        return  # нераспознанные сообщения игнорируем (не спамим справкой)
-
-    if action == "start":
-        await event.respond(start_reader(lang), buttons=keyboard(lang))
-    elif action == "stop":
-        await event.respond(stop_reader(lang), buttons=keyboard(lang))
-    elif action == "restart":
+    if text.startswith(("/start", "/menu")):
+        m_text, m_buttons = menu_main(lang)
+        await event.respond(m_text, buttons=m_buttons)
+    elif text.startswith("/help"):
+        m_text, m_buttons = menu_help(lang)
+        await event.respond(m_text, buttons=m_buttons)
+    elif text.startswith("/stop"):
+        msg = stop_reader(lang)
+        m_text, m_buttons = menu_control(lang)
+        await event.respond(f"{msg}\n\n{m_text}", buttons=m_buttons)
+    elif text.startswith("/restart"):
         stop_reader(lang)
-        await event.respond(start_reader(lang), buttons=keyboard(lang))
-    elif action == "status":
-        await event.respond(status_text(lang), buttons=keyboard(lang))
-    elif action == "hh":
-        await event.respond(t(lang, "running", name="hh.py"))
-        await event.respond(await run_script("hh.py", lang), buttons=keyboard(lang))
-    elif action == "remoteok":
-        await event.respond(t(lang, "running", name="remoteok.py"))
-        await event.respond(await run_script("remoteok.py", lang), buttons=keyboard(lang))
-    elif action == "wwr":
-        await event.respond(t(lang, "running", name="weworkremotely.py"))
-        await event.respond(await run_script("weworkremotely.py", lang), buttons=keyboard(lang))
-    elif action == "vac":
-        await event.respond(
-            vacancies_text(lang, parse_count(event.raw_text or "")),
-            buttons=keyboard(lang),
-            link_preview=False,
-        )
-    elif action == "help":
-        await event.respond(t(lang, "help"), buttons=keyboard(lang))
-    elif action == "cancel":
-        await event.respond(t(lang, "cancelled"), buttons=Button.clear())
-    elif action == "lang":
+        msg = start_reader(lang)
+        m_text, m_buttons = menu_control(lang)
+        await event.respond(f"{msg}\n\n{m_text}", buttons=m_buttons)
+    elif text.startswith("/status"):
+        m_text, m_buttons = menu_control(lang)
+        await event.respond(m_text, buttons=m_buttons)
+    elif text.startswith(("/lang", "/language")):
         await event.respond(t(lang, "choose_lang"), buttons=LANG_BUTTONS)
+    # остальное игнорируем (без спама справкой)
 
 
 def main():
@@ -453,6 +464,9 @@ def main():
         raise SystemExit("BOT_TOKEN не задан в .env (получи у @BotFather).")
     bot.start(bot_token=BOT_TOKEN)
     print("Control bot started.")
+    # Авто-старт слушателя каналов: новые вакансии форвардятся в n8n как раньше,
+    # не дожидаясь нажатия «Старт». Если уже запущен — ничего не делает.
+    print(start_reader(DEFAULT_LANG))
     bot.run_until_disconnected()
 
 
