@@ -18,7 +18,12 @@ _lock = threading.Lock()
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    # WAL + busy_timeout: бот (чтение для статуса/пагинации) и channels.py/
+    # источники (запись) работают с БД параллельно из разных процессов —
+    # иначе SQLite сразу кидает "database is locked".
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS vacancies (
@@ -28,23 +33,32 @@ def _connect() -> sqlite3.Connection:
             url        TEXT,
             score      INTEGER,
             decision   TEXT,
-            created_at TEXT
+            created_at TEXT,
+            message    TEXT
         )
         """
     )
+    # Миграция старых БД: добавляем колонку message, если её ещё нет.
+    try:
+        conn.execute("ALTER TABLE vacancies ADD COLUMN message TEXT")
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
-def save_vacancy(vacancy_id, channel, title, url, score=None, decision=None):
-    """Сохранить вакансию. Повторный id игнорируется (INSERT OR IGNORE)."""
+def save_vacancy(vacancy_id, channel, title, url, score=None, decision=None, message=None):
+    """Сохранить вакансию. Повторный id игнорируется (INSERT OR IGNORE).
+
+    message — готовый текст из ответа n8n (если вернул), для показа в пагинации.
+    """
     with _lock:
         conn = _connect()
         try:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO vacancies
-                    (id, channel, title, url, score, decision, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, channel, title, url, score, decision, created_at, message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     vacancy_id,
@@ -54,6 +68,7 @@ def save_vacancy(vacancy_id, channel, title, url, score=None, decision=None):
                     score,
                     decision,
                     datetime.now(timezone.utc).isoformat(),
+                    message,
                 ),
             )
             conn.commit()
@@ -71,7 +86,7 @@ def recent(limit: int, prefix: str = None):
         if prefix:
             return conn.execute(
                 """
-                SELECT title, channel, url, score, created_at
+                SELECT title, channel, url, score, message, created_at
                 FROM vacancies WHERE id LIKE ?
                 ORDER BY created_at DESC LIMIT ?
                 """,
@@ -79,7 +94,7 @@ def recent(limit: int, prefix: str = None):
             ).fetchall()
         return conn.execute(
             """
-            SELECT title, channel, url, score, created_at
+            SELECT title, channel, url, score, message, created_at
             FROM vacancies ORDER BY created_at DESC LIMIT ?
             """,
             (limit,),
@@ -112,20 +127,21 @@ def stats() -> dict:
 
 
 def parse_ai_result(response):
-    """Достать (score, decision) из ответа вебхука n8n, если он их вернул.
+    """Достать (score, decision, message) из ответа вебхука n8n, если он вернул.
 
     Терпимо к формату: объект {...}, либо массив [{...}] (как у n8n).
-    Если ответ не JSON или полей нет — вернёт (None, None).
+    message — готовый текст для Telegram (ключи message/text/output/...).
+    Если ответ не JSON или полей нет — вернёт (None, None, None).
     """
     try:
         data = response.json()
     except Exception:
-        return None, None
+        return None, None, None
 
     if isinstance(data, list):
         data = data[0] if data else {}
     if not isinstance(data, dict):
-        return None, None
+        return None, None, None
 
     score = data.get("score")
     try:
@@ -134,4 +150,12 @@ def parse_ai_result(response):
         score = None
 
     decision = data.get("decision")
-    return score, decision
+
+    message = None
+    for key in ("message", "text", "output", "formatted", "telegram", "result"):
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            message = val
+            break
+
+    return score, decision, message

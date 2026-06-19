@@ -54,13 +54,13 @@ async def send_to_n8n(message):
         "posted_at": message.date.isoformat(),
     }
 
+    score, decision, ai_message = None, None, None
     try:
         response = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=15)
         print("Sent to n8n:", response.status_code, payload["channel"], text[:120])
-        score, decision = db.parse_ai_result(response)
+        score, decision, ai_message = db.parse_ai_result(response)
     except Exception as e:
         print("Error sending to n8n:", e)
-        score, decision = None, None
 
     db.save_vacancy(
         vacancy_id=f"telegram_{message.chat_id}_{message.id}",
@@ -69,6 +69,7 @@ async def send_to_n8n(message):
         url=payload["url"],
         score=score,
         decision=decision,
+        message=ai_message,
     )
 
 

@@ -6,8 +6,10 @@ venv/
 # Локальное состояние дедупа (обработанные вакансии)
 processed_*.json
 
-# Локальная БД вакансий
+# Локальная БД вакансий (+ WAL-спутники)
 vacancies.db
+vacancies.db-wal
+vacancies.db-shm
 
 # Состояние/логи управляющего бота
 reader.pid

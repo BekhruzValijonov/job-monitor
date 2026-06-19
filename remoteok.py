@@ -90,11 +90,11 @@ def send_to_n8n(job: dict):
         print("[dry-run] would send:", payload["title"])
         return
 
-    score, decision = None, None
+    score, decision, ai_message = None, None, None
     try:
         res = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=20)
         print("Sent to n8n:", res.status_code, payload["title"])
-        score, decision = db.parse_ai_result(res)
+        score, decision, ai_message = db.parse_ai_result(res)
     except Exception as e:
         print("Error sending to n8n:", e)
 
@@ -105,6 +105,7 @@ def send_to_n8n(job: dict):
         url=payload["url"],
         score=score,
         decision=decision,
+        message=ai_message,
     )
 
 

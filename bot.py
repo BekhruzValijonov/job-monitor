@@ -1,27 +1,28 @@
-"""Управляющий Телеграм-бот (мультиязычный: ru / uz / en) с вложенным меню.
+"""Управляющий Телеграм-бот (мультиязычный: ru / uz / en).
 
-Навигация (inline-кнопки):
+Навигация — reply-клавиатурой (кнопки в нижней панели у поля ввода):
   /start → Главное меню
-    ├─ 🛠 Управление ботом → Старт / Стоп / Рестарт / Статус
-    ├─ 📋 Вакансии → источник (Каналы / RemoteOK / WWR / HH)
-    │                  └─ источник → пагинация 5 / 10 / 15 → список вакансий
+    ├─ 🛠 Управление ботом → Старт / Стоп / Рестарт / Статус / ⬅️ Назад
+    ├─ 📋 Вакансии → источник (Каналы / RemoteOK / WWR / HH) / ⬅️ Назад
+    │                  └─ источник → 📋 5 / 10 / 15 → список вакансий / ⬅️ Назад
     ├─ 🌐 Язык
     └─ ❓ Помощь
 
-Запуск: python bot.py  (или python main.py). Нужен BOT_TOKEN от @BotFather.
-Доступ ограничен OWNER_ID (если задан). Чтение Telegram-каналов — channels.py,
-его запускает кнопка «Старт» (pid в reader.pid, лог в logs/reader.log).
+Запуск: python bot.py (или python main.py). Нужен BOT_TOKEN от @BotFather.
+Слушатель каналов (channels.py) авто-стартует — вакансии форвардятся в n8n.
+Пагинация показывает вакансии из БД: если n8n вернул готовый текст в ответе
+вебхука — дословно, иначе формат собирается из сохранённых полей.
 """
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
-from telethon.errors import MessageNotModifiedError
 
 import db
 
@@ -38,13 +39,16 @@ LANG_FILE = "settings.json"
 DEFAULT_LANG = "ru"
 READER_CMD = [sys.executable, "channels.py"]
 
-# Источники вакансий: ключ -> (подпись, префикс id в БД)
+# Источники: ключ -> (ключ подписи, префикс id в БД)
 SOURCES = {
     "channels": ("src_channels", "telegram_"),
     "remoteok": ("src_remoteok", "remoteok_"),
     "wwr": ("src_wwr", "wwr_"),
     "hh": ("src_hh", "hh_"),
 }
+
+# Навигационное состояние по пользователю (в памяти): {uid: {"menu":..,"source":..}}
+nav = {}
 
 bot = TelegramClient("vacancy_bot_session", API_ID, API_HASH)
 
@@ -62,8 +66,9 @@ TR = {
         "src_wwr": "💼 WWR", "src_hh": "🔎 HH",
         "sources_title": "📋 Выберите источник:",
         "page_title": "📋 {source}: сколько вакансий показать?",
-        "vac_header": "📋 Последние вакансии — {source}:",
         "vac_empty": "📭 Вакансий пока нет.",
+        "f_score": "⭐️ Оценка: {score}/100",
+        "f_link": "🔗 Ссылка:", "f_channel": "📢 Канал:",
         "already_running": "✅ Мониторинг уже запущен.",
         "started": "▶️ Мониторинг запущен (pid {pid}).",
         "stopped": "⏸ Мониторинг остановлен.",
@@ -90,8 +95,9 @@ TR = {
         "src_wwr": "💼 WWR", "src_hh": "🔎 HH",
         "sources_title": "📋 Manbani tanlang:",
         "page_title": "📋 {source}: nechta vakansiya ko'rsatilsin?",
-        "vac_header": "📋 Oxirgi vakansiyalar — {source}:",
         "vac_empty": "📭 Hozircha vakansiya yo'q.",
+        "f_score": "⭐️ Baho: {score}/100",
+        "f_link": "🔗 Havola:", "f_channel": "📢 Kanal:",
         "already_running": "✅ Monitoring allaqachon ishlamoqda.",
         "started": "▶️ Monitoring ishga tushdi (pid {pid}).",
         "stopped": "⏸ Monitoring to'xtatildi.",
@@ -118,8 +124,9 @@ TR = {
         "src_wwr": "💼 WWR", "src_hh": "🔎 HH",
         "sources_title": "📋 Choose a source:",
         "page_title": "📋 {source}: how many vacancies to show?",
-        "vac_header": "📋 Latest vacancies — {source}:",
         "vac_empty": "📭 No vacancies yet.",
+        "f_score": "⭐️ Score: {score}/100",
+        "f_link": "🔗 Link:", "f_channel": "📢 Channel:",
         "already_running": "✅ Monitoring is already running.",
         "started": "▶️ Monitoring started (pid {pid}).",
         "stopped": "⏸ Monitoring stopped.",
@@ -145,78 +152,45 @@ def t(lang: str, key: str, **kwargs) -> str:
     return text.format(**kwargs) if kwargs else text
 
 
-LANG_BUTTONS = [
-    [
-        Button.inline("🇷🇺 Русский", b"lang_ru"),
-        Button.inline("🇺🇿 O'zbek", b"lang_uz"),
-        Button.inline("🇬🇧 English", b"lang_en"),
-    ]
-]
+# --- Reply-клавиатуры ------------------------------------------------------
 
-
-# --- Меню (inline) ---------------------------------------------------------
-
-def menu_main(lang):
-    buttons = [
-        [Button.inline(t(lang, "b_control"), b"m_control")],
-        [Button.inline(t(lang, "b_sources"), b"m_sources")],
-        [Button.inline(t(lang, "b_lang"), b"m_lang"),
-         Button.inline(t(lang, "b_help"), b"m_help")],
-    ]
-    return t(lang, "m_title"), buttons
-
-
-def menu_control(lang):
-    buttons = [
-        [Button.inline(t(lang, "b_start"), b"c_start"),
-         Button.inline(t(lang, "b_stop"), b"c_stop")],
-        [Button.inline(t(lang, "b_restart"), b"c_restart"),
-         Button.inline(t(lang, "b_status"), b"c_status")],
-        [Button.inline(t(lang, "b_back"), b"m_main")],
-    ]
-    return f"{t(lang, 'b_control')}\n\n{status_text(lang)}", buttons
-
-
-def menu_sources(lang):
-    buttons = [
-        [Button.inline(t(lang, "src_channels"), b"s_channels"),
-         Button.inline(t(lang, "src_remoteok"), b"s_remoteok")],
-        [Button.inline(t(lang, "src_wwr"), b"s_wwr"),
-         Button.inline(t(lang, "src_hh"), b"s_hh")],
-        [Button.inline(t(lang, "b_back"), b"m_main")],
-    ]
-    return t(lang, "sources_title"), buttons
-
-
-def _pagination_rows(source):
+def kb_main(lang):
     return [
-        Button.inline("📋 5", f"p_{source}_5".encode()),
-        Button.inline("📋 10", f"p_{source}_10".encode()),
-        Button.inline("📋 15", f"p_{source}_15".encode()),
+        [Button.text(t(lang, "b_control"), resize=True)],
+        [Button.text(t(lang, "b_sources"), resize=True)],
+        [Button.text(t(lang, "b_lang"), resize=True), Button.text(t(lang, "b_help"), resize=True)],
     ]
 
 
-def menu_pagination(lang, source):
-    label = t(lang, SOURCES[source][0])
-    buttons = [
-        _pagination_rows(source),
-        [Button.inline(t(lang, "b_back"), b"m_sources")],
+def kb_control(lang):
+    return [
+        [Button.text(t(lang, "b_start"), resize=True), Button.text(t(lang, "b_stop"), resize=True)],
+        [Button.text(t(lang, "b_restart"), resize=True), Button.text(t(lang, "b_status"), resize=True)],
+        [Button.text(t(lang, "b_back"), resize=True)],
     ]
-    return t(lang, "page_title", source=label), buttons
 
 
-def view_vacancies(lang, source, count):
-    label = t(lang, SOURCES[source][0])
-    text = vacancies_text(lang, count, label, SOURCES[source][1])
-    buttons = [
-        _pagination_rows(source),
-        [Button.inline(t(lang, "b_back"), b"m_sources")],
+def kb_sources(lang):
+    return [
+        [Button.text(t(lang, "src_channels"), resize=True), Button.text(t(lang, "src_remoteok"), resize=True)],
+        [Button.text(t(lang, "src_wwr"), resize=True), Button.text(t(lang, "src_hh"), resize=True)],
+        [Button.text(t(lang, "b_back"), resize=True)],
     ]
-    return text, buttons
 
 
-def menu_help(lang):
-    return t(lang, "help"), [[Button.inline(t(lang, "b_back"), b"m_main")]]
+def kb_pagination(lang):
+    return [
+        [Button.text("📋 5", resize=True), Button.text("📋 10", resize=True), Button.text("📋 15", resize=True)],
+        [Button.text(t(lang, "b_back"), resize=True)],
+    ]
+
+
+def kb_lang():
+    return [
+        [Button.text("🇷🇺 Русский", resize=True),
+         Button.text("🇺🇿 O'zbek", resize=True),
+         Button.text("🇬🇧 English", resize=True)],
+    ]
 
 
 # --- Выбор языка (персистентно, по пользователю) ---------------------------
@@ -333,17 +307,6 @@ def _cleanup_pid():
 
 # --- Тексты ----------------------------------------------------------------
 
-def vacancies_text(lang: str, count: int, source_label: str, prefix: str) -> str:
-    rows = db.recent(count, prefix)
-    if not rows:
-        return t(lang, "vac_empty")
-    lines = [t(lang, "vac_header", source=source_label)]
-    for i, (title, channel, url, score, _created) in enumerate(rows, 1):
-        star = f" ⭐ {score}" if score is not None else ""
-        lines.append(f"{i}. {title or '—'} — {channel or '—'}{star}\n{url or ''}")
-    return "\n\n".join(lines)
-
-
 def status_text(lang: str) -> str:
     running = t(lang, "st_on") if reader_running() else t(lang, "st_off")
     s = db.stats()
@@ -356,71 +319,99 @@ def status_text(lang: str) -> str:
     return "\n".join(lines)
 
 
-# --- Хендлеры --------------------------------------------------------------
+def format_vacancy(lang: str, row) -> str:
+    """Богатый формат вакансии для пагинации.
+
+    row = (title, channel, url, score, message, created_at). Если есть готовый
+    текст из n8n (message) — отдаём его дословно (как приходит автоматически),
+    иначе собираем формат из сохранённых полей.
+    """
+    title, channel, url, score, message, _created = row
+    if message and message.strip():
+        return message
+
+    parts = [f"🔥 {title or '—'}"]
+    if score is not None:
+        parts.append(t(lang, "f_score", score=score))
+    if url:
+        parts.append(f"{t(lang, 'f_link')}\n{url}")
+    if channel:
+        parts.append(f"{t(lang, 'f_channel')}\n{channel}")
+    return "\n\n".join(parts)
+
+
+# --- Роутинг ---------------------------------------------------------------
+
+def parse_nav(text: str):
+    """(token, arg) для навигации. Эмодзи одинаковы во всех языках."""
+    raw = text.strip()
+    low = raw.lower()
+
+    if low.startswith(("/start", "/menu")):
+        return ("menu", None)
+    if low.startswith("/help"):
+        return ("help", None)
+    if low.startswith("/stop"):
+        return ("c_stop", None)
+    if low.startswith("/restart"):
+        return ("c_restart", None)
+    if low.startswith("/status"):
+        return ("c_status", None)
+    if low.startswith(("/lang", "/language")):
+        return ("lang", None)
+
+    # выбор языка
+    if "🇷🇺" in raw or "русск" in low:
+        return ("setlang", "ru")
+    if "🇺🇿" in raw or "o'zbek" in low or "ozbek" in low or "узбек" in low:
+        return ("setlang", "uz")
+    if "🇬🇧" in raw or "english" in low:
+        return ("setlang", "en")
+
+    if "⬅️" in raw or "назад" in low or "orqaga" in low or "back" in low:
+        return ("back", None)
+
+    # пагинация: 📋 + число
+    if "📋" in raw and any(c.isdigit() for c in raw):
+        m = re.search(r"\d+", raw)
+        n = int(m.group()) if m else 5
+        return ("page", n if n in (5, 10, 15) else 5)
+
+    # источники
+    if "📨" in raw or "канал" in low or "kanal" in low or "channel" in low:
+        return ("src_channels", None)
+    if "remoteok" in low:
+        return ("src_remoteok", None)
+    if "💼" in raw or "wwr" in low or "weworkremotely" in low:
+        return ("src_wwr", None)
+    if "🔎" in raw:
+        return ("src_hh", None)
+
+    # управление
+    if "🔄" in raw or "рестарт" in low or "restart" in low or "qayta" in low:
+        return ("c_restart", None)
+    if "▶️" in raw or "старт" in low or "boshlash" in low:
+        return ("c_start", None)
+    if "⏸" in raw or "стоп" in low or "to'xtat" in low:
+        return ("c_stop", None)
+    if "📊" in raw or "статус" in low or "status" in low or "holat" in low:
+        return ("c_status", None)
+
+    # меню
+    if "🛠" in raw or "управлен" in low or "boshqar" in low or "control" in low:
+        return ("control", None)
+    if "🌐" in raw or "язык" in low or "language" in low or low == "til":
+        return ("lang", None)
+    if "📋" in raw or "ваканс" in low or "vacanc" in low or "vakans" in low:
+        return ("sources", None)
+    if "❓" in raw or "помощ" in low or "yordam" in low or "help" in low:
+        return ("help", None)
+
+    return (None, None)
+
 
 def _authorized(event) -> bool:
     return OWNER_ID is None or event.sender_id == OWNER_ID
-
-
-async def _edit(event, text, buttons):
-    try:
-        await event.edit(text, buttons=buttons, link_preview=False)
-    except MessageNotModifiedError:
-        pass
-
-
-@bot.on(events.CallbackQuery)
-async def on_callback(event):
-    if not _authorized(event):
-        return
-
-    data = event.data.decode()
-
-    # Выбор языка
-    if data.startswith("lang_"):
-        lang = data.split("_", 1)[1]
-        if lang not in TR:
-            lang = DEFAULT_LANG
-        set_lang(event.sender_id, lang)
-        await event.answer()
-        await _edit(event, *menu_main(lang))
-        return
-
-    lang = get_lang(event.sender_id)
-
-    if data == "m_main":
-        await _edit(event, *menu_main(lang))
-    elif data == "m_control":
-        await _edit(event, *menu_control(lang))
-    elif data == "m_sources":
-        await _edit(event, *menu_sources(lang))
-    elif data == "m_lang":
-        await _edit(event, t(lang, "choose_lang"), LANG_BUTTONS)
-    elif data == "m_help":
-        await _edit(event, *menu_help(lang))
-    elif data == "c_start":
-        await event.answer(start_reader(lang))
-        await _edit(event, *menu_control(lang))
-    elif data == "c_stop":
-        await event.answer(stop_reader(lang))
-        await _edit(event, *menu_control(lang))
-    elif data == "c_restart":
-        stop_reader(lang)
-        await event.answer(start_reader(lang))
-        await _edit(event, *menu_control(lang))
-    elif data == "c_status":
-        await event.answer()
-        await _edit(event, *menu_control(lang))
-    elif data.startswith("s_"):
-        source = data[2:]
-        if source in SOURCES:
-            await event.answer()
-            await _edit(event, *menu_pagination(lang, source))
-    elif data.startswith("p_"):
-        _, source, count = data.split("_", 2)
-        if source in SOURCES:
-            await event.answer()
-            await _edit(event, *view_vacancies(lang, source, int(count)))
 
 
 @bot.on(events.NewMessage(incoming=True))
@@ -428,34 +419,72 @@ async def handler(event):
     if not _authorized(event):
         return
 
+    uid = event.sender_id
+
     # Онбординг: пока язык не выбран — сначала выбор языка.
-    if not has_lang(event.sender_id):
-        await event.respond(t(DEFAULT_LANG, "choose_lang"), buttons=LANG_BUTTONS)
+    if not has_lang(uid):
+        await event.respond(t(DEFAULT_LANG, "choose_lang"), buttons=kb_lang())
         return
 
-    lang = get_lang(event.sender_id)
-    text = (event.raw_text or "").strip().lower()
+    lang = get_lang(uid)
+    token, arg = parse_nav(event.raw_text or "")
+    st = nav.setdefault(uid, {"menu": "main", "source": None})
 
-    if text.startswith(("/start", "/menu")):
-        m_text, m_buttons = menu_main(lang)
-        await event.respond(m_text, buttons=m_buttons)
-    elif text.startswith("/help"):
-        m_text, m_buttons = menu_help(lang)
-        await event.respond(m_text, buttons=m_buttons)
-    elif text.startswith("/stop"):
-        msg = stop_reader(lang)
-        m_text, m_buttons = menu_control(lang)
-        await event.respond(f"{msg}\n\n{m_text}", buttons=m_buttons)
-    elif text.startswith("/restart"):
+    if token == "setlang":
+        set_lang(uid, arg)
+        st["menu"] = "main"
+        await event.respond(t(arg, "m_title"), buttons=kb_main(arg))
+    elif token == "menu":
+        st["menu"] = "main"
+        await event.respond(t(lang, "m_title"), buttons=kb_main(lang))
+    elif token == "control":
+        st["menu"] = "control"
+        await event.respond(status_text(lang), buttons=kb_control(lang))
+    elif token == "sources":
+        st["menu"] = "sources"
+        await event.respond(t(lang, "sources_title"), buttons=kb_sources(lang))
+    elif token == "lang":
+        await event.respond(t(lang, "choose_lang"), buttons=kb_lang())
+    elif token == "help":
+        await event.respond(t(lang, "help"), buttons=kb_main(lang))
+    elif token == "c_start":
+        st["menu"] = "control"
+        await event.respond(start_reader(lang), buttons=kb_control(lang))
+    elif token == "c_stop":
+        st["menu"] = "control"
+        await event.respond(stop_reader(lang), buttons=kb_control(lang))
+    elif token == "c_restart":
+        st["menu"] = "control"
         stop_reader(lang)
-        msg = start_reader(lang)
-        m_text, m_buttons = menu_control(lang)
-        await event.respond(f"{msg}\n\n{m_text}", buttons=m_buttons)
-    elif text.startswith("/status"):
-        m_text, m_buttons = menu_control(lang)
-        await event.respond(m_text, buttons=m_buttons)
-    elif text.startswith(("/lang", "/language")):
-        await event.respond(t(lang, "choose_lang"), buttons=LANG_BUTTONS)
+        await event.respond(start_reader(lang), buttons=kb_control(lang))
+    elif token == "c_status":
+        st["menu"] = "control"
+        await event.respond(status_text(lang), buttons=kb_control(lang))
+    elif token in ("src_channels", "src_remoteok", "src_wwr", "src_hh"):
+        source = token[4:]
+        st["source"] = source
+        st["menu"] = "pagination"
+        label = t(lang, SOURCES[source][0])
+        await event.respond(t(lang, "page_title", source=label), buttons=kb_pagination(lang))
+    elif token == "page":
+        source = st.get("source")
+        if not source:
+            st["menu"] = "sources"
+            await event.respond(t(lang, "sources_title"), buttons=kb_sources(lang))
+        else:
+            rows = db.recent(arg, SOURCES[source][1])
+            if not rows:
+                await event.respond(t(lang, "vac_empty"), buttons=kb_pagination(lang))
+            else:
+                for row in rows:
+                    await event.respond(format_vacancy(lang, row), link_preview=False)
+    elif token == "back":
+        if st.get("menu") == "pagination":
+            st["menu"] = "sources"
+            await event.respond(t(lang, "sources_title"), buttons=kb_sources(lang))
+        else:
+            st["menu"] = "main"
+            await event.respond(t(lang, "m_title"), buttons=kb_main(lang))
     # остальное игнорируем (без спама справкой)
 
 
@@ -464,8 +493,7 @@ def main():
         raise SystemExit("BOT_TOKEN не задан в .env (получи у @BotFather).")
     bot.start(bot_token=BOT_TOKEN)
     print("Control bot started.")
-    # Авто-старт слушателя каналов: новые вакансии форвардятся в n8n как раньше,
-    # не дожидаясь нажатия «Старт». Если уже запущен — ничего не делает.
+    # Авто-старт слушателя каналов: новые вакансии форвардятся в n8n как раньше.
     print(start_reader(DEFAULT_LANG))
     bot.run_until_disconnected()
 
