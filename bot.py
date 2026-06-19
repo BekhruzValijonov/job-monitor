@@ -412,26 +412,30 @@ def _state(uid):
     return st
 
 
-async def _clean(event, st):
-    """Убрать мусор навигации: удалить нажатие пользователя и прошлое меню-сообщение."""
+async def _del_user(event):
     try:
         await event.delete()
     except Exception:
         pass
-    prev = st.get("msg")
-    if prev:
+
+
+async def _del_msg(chat_id, msg_id):
+    if msg_id:
         try:
-            await bot.delete_messages(event.chat_id, prev)
+            await bot.delete_messages(chat_id, msg_id)
         except Exception:
             pass
-        st["msg"] = None
 
 
 async def _render(event, st, text, buttons):
-    """Показать экран навигации, не засоряя чат: чистим прошлое, шлём новое меню."""
-    await _clean(event, st)
+    """Показать меню без мусора. Порядок важен: удаляем нажатие, шлём НОВОЕ меню
+    (с клавиатурой) и ТОЛЬКО ПОТОМ удаляем прошлое — иначе при удалении сообщения
+    с reply-клавиатурой она пропадает и приходится жать /start заново."""
+    await _del_user(event)
+    prev = st.get("msg")
     m = await event.respond(text, buttons=buttons)
     st["msg"] = m.id
+    await _del_msg(event.chat_id, prev)
 
 
 @bot.on(events.NewMessage(incoming=True))
@@ -506,19 +510,25 @@ async def handler(event):
             st["menu"] = "sources"
             await _render(event, st, t(lang, "sources_title"), kb_sources(lang))
         else:
-            # чистим навигацию, но сами вакансии оставляем в чате
-            await _clean(event, st)
+            await _del_user(event)
+            prev = st.get("msg")
+            st["msg"] = None
             rows = db.recent(arg, SOURCES[source][1])
             if not rows:
                 m = await event.respond(t(lang, "vac_empty"), buttons=kb_pagination(lang))
                 st["msg"] = m.id
             else:
-                for row in rows:
+                # Клавиатуру вешаем на ПОСЛЕДНЮЮ вакансию, чтобы reply-кнопки не
+                # пропали (сообщения вакансий не удаляем — это контент).
+                last = len(rows) - 1
+                for i, row in enumerate(rows):
                     await event.respond(
                         format_vacancy(lang, row),
+                        buttons=kb_pagination(lang) if i == last else None,
                         link_preview=False,
                         parse_mode=None,  # текст n8n/URL не парсим как markdown
                     )
+            await _del_msg(event.chat_id, prev)
     elif token == "back":
         if st.get("menu") == "pagination":
             st["menu"] = "sources"
