@@ -414,21 +414,25 @@ async def handler(event):
         return
 
     uid = event.sender_id
+    token, arg = parse_nav(event.raw_text or "")
 
-    # Онбординг: пока язык не выбран — сначала выбор языка.
+    # Выбор языка обрабатываем ПЕРВЫМ — в т.ч. на онбординге, иначе проверка
+    # has_lang ниже перехватывала бы нажатие флага и зацикливала выбор языка.
+    if token == "setlang":
+        set_lang(uid, arg)
+        nav.setdefault(uid, {"menu": "main", "source": None})["menu"] = "main"
+        await event.respond(t(arg, "m_title"), buttons=kb_main(arg))
+        return
+
+    # Онбординг: пока язык не выбран — показываем выбор языка.
     if not has_lang(uid):
         await event.respond(t(DEFAULT_LANG, "choose_lang"), buttons=kb_lang())
         return
 
     lang = get_lang(uid)
-    token, arg = parse_nav(event.raw_text or "")
     st = nav.setdefault(uid, {"menu": "main", "source": None})
 
-    if token == "setlang":
-        set_lang(uid, arg)
-        st["menu"] = "main"
-        await event.respond(t(arg, "m_title"), buttons=kb_main(arg))
-    elif token == "menu":
+    if token == "menu":
         st["menu"] = "main"
         await event.respond(t(lang, "m_title"), buttons=kb_main(lang))
     elif token == "control":
@@ -491,16 +495,31 @@ _instance_lock = None  # держим открытый файл, чтобы floc
 
 def _ensure_single_instance():
     """Не дать запустить второй экземпляр бота: иначе два процесса дерутся
-    за файл сессии Telethon → 'database is locked'."""
+    за файл сессии Telethon → 'database is locked'.
+
+    Важно: main.py и bot.py запускают ОДНОГО И ТОГО ЖЕ бота (main.py делает
+    `from bot import main`), поэтому они делят этот lock — запускать нужно
+    что-то одно.
+    """
     global _instance_lock
-    _instance_lock = open("bot.lock", "w")
+    # "a+" (не "w") — чтобы при неудачном захвате не затереть PID владельца.
+    _instance_lock = open("bot.lock", "a+")
     try:
         fcntl.flock(_instance_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        _instance_lock.seek(0)
+        holder = _instance_lock.read().strip() or "?"
         raise SystemExit(
-            "Бот уже запущен (bot.lock занят другим процессом).\n"
-            "Останови старый процесс: pkill -f bot.py"
+            f"Бот уже запущен — его держит процесс PID {holder} "
+            "(это python main.py или python bot.py — это один и тот же бот).\n"
+            f"Останови его: kill {holder}\n"
+            "или все разом: pkill -f 'main.py'; pkill -f 'bot.py'"
         )
+    # Мы владелец — записываем свой PID, чтобы следующий показал, кого убивать.
+    _instance_lock.seek(0)
+    _instance_lock.truncate()
+    _instance_lock.write(str(os.getpid()))
+    _instance_lock.flush()
 
 
 def main():
