@@ -75,6 +75,7 @@ TR = {
         "sources_title": "📋 Выберите источник:",
         "page_title": "📋 {source}: сколько вакансий показать?",
         "vac_empty": "📭 Вакансий пока нет.",
+        "vac_no_new": "📭 Новых вакансий нет.",
         "f_score": "⭐️ Оценка: {score}/100",
         "f_link": "🔗 Ссылка:", "f_channel": "📢 Канал:",
         "already_running": "✅ Мониторинг уже запущен.",
@@ -104,6 +105,7 @@ TR = {
         "sources_title": "📋 Manbani tanlang:",
         "page_title": "📋 {source}: nechta vakansiya ko'rsatilsin?",
         "vac_empty": "📭 Hozircha vakansiya yo'q.",
+        "vac_no_new": "📭 Yangi vakansiya yo'q.",
         "f_score": "⭐️ Baho: {score}/100",
         "f_link": "🔗 Havola:", "f_channel": "📢 Kanal:",
         "already_running": "✅ Monitoring allaqachon ishlamoqda.",
@@ -133,6 +135,7 @@ TR = {
         "sources_title": "📋 Choose a source:",
         "page_title": "📋 {source}: how many vacancies to show?",
         "vac_empty": "📭 No vacancies yet.",
+        "vac_no_new": "📭 No new vacancies.",
         "f_score": "⭐️ Score: {score}/100",
         "f_link": "🔗 Link:", "f_channel": "📢 Channel:",
         "already_running": "✅ Monitoring is already running.",
@@ -409,6 +412,9 @@ def _authorized(event) -> bool:
 def _state(uid):
     st = nav.setdefault(uid, {"menu": "main", "source": None, "msg": None})
     st.setdefault("msg", None)
+    # seen: {source -> курсор created_at последней показанной вакансии}.
+    # Повторный «📋 N» по тому же источнику отдаёт только то, что новее курсора.
+    st.setdefault("seen", {})
     return st
 
 
@@ -513,11 +519,18 @@ async def handler(event):
             await _del_user(event)
             prev = st.get("msg")
             st["msg"] = None
-            rows = db.recent(arg, SOURCES[source][1])
+            cursor = st["seen"].get(source)
+            rows = db.recent(arg, SOURCES[source][1], after=cursor)
             if not rows:
-                m = await event.respond(t(lang, "vac_empty"), buttons=kb_pagination(lang))
+                # cursor задан → уже что-то показывали, значит просто нет НОВЫХ;
+                # cursor пуст → по источнику вообще ничего нет.
+                key = "vac_no_new" if cursor else "vac_empty"
+                m = await event.respond(t(lang, key), buttons=kb_pagination(lang))
                 st["msg"] = m.id
             else:
+                # Сдвигаем курсор на новейшую показанную, чтобы следующий запрос
+                # не повторял её и более старые.
+                st["seen"][source] = max(r[5] for r in rows)
                 # Клавиатуру вешаем на ПОСЛЕДНЮЮ вакансию, чтобы reply-кнопки не
                 # пропали (сообщения вакансий не удаляем — это контент).
                 last = len(rows) - 1

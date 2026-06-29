@@ -98,10 +98,17 @@ def save_vacancy(vacancy_id, channel, title, url, ai=None):
             conn.close()
 
 
-def recent(limit: int, prefix: str = None):
-    """Последние вакансии (для пагинации в боте): title, channel, url, score.
+def recent(limit: int, prefix: str = None, after: str = None):
+    """Вакансии для пагинации в боте: title, channel, url, score, message, created_at.
 
     prefix — фильтр по источнику через префикс id (telegram_/hh_/remoteok_/wwr_).
+    after — курсор created_at: если задан, отдаём ТОЛЬКО записи новее курсора
+    (created_at > after) по ВОЗРАСТАНИЮ, чтобы повторный запрос показывал лишь
+    новые вакансии, а не повторял уже показанные. Без after — последние N по
+    убыванию (новейшие первыми), как при первом запросе.
+
+    created_at пишется через datetime.isoformat() в UTC — формат лексикографически
+    сравним, поэтому сравнение/сортировка по TEXT эквивалентны хронологическим.
     """
     conn = _connect()
     try:
@@ -110,14 +117,20 @@ def recent(limit: int, prefix: str = None):
         cols = ("SELECT title, channel, url, "
                 "COALESCE(ai_score, score), COALESCE(ai_message, message), created_at "
                 "FROM vacancies")
+        where = []
+        params = []
         if prefix:
-            return conn.execute(
-                cols + " WHERE id LIKE ? ORDER BY created_at DESC LIMIT ?",
-                (prefix + "%", limit),
-            ).fetchall()
+            where.append("id LIKE ?")
+            params.append(prefix + "%")
+        if after:
+            where.append("created_at > ?")
+            params.append(after)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        order = "ASC" if after else "DESC"
+        params.append(limit)
         return conn.execute(
-            cols + " ORDER BY created_at DESC LIMIT ?",
-            (limit,),
+            f"{cols}{clause} ORDER BY created_at {order} LIMIT ?",
+            params,
         ).fetchall()
     finally:
         conn.close()
